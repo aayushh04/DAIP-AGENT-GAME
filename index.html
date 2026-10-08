@@ -1,0 +1,1618 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>HUNTED — Game AI Demo</title>
+<style>
+  :root { --bg:#07080c; --panel:#11141c; --line:#2a3040; --fg:#cfd6e6; --accent:#ffb347; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--fg); font:13px/1.3 system-ui,Segoe UI,Roboto,sans-serif; }
+  body { display:flex; flex-direction:column; align-items:center; justify-content:center; gap:8px; padding:8px; overflow:hidden; }
+  #wrap { position:relative; width:min(100vw - 16px, (100vh - 70px) * 1.5); aspect-ratio:960/640; }
+  canvas { width:100%; height:100%; display:block; background:#000; border:1px solid var(--line); border-radius:6px; touch-action:none; cursor:crosshair; }
+  #bar { display:flex; flex-wrap:wrap; gap:6px; justify-content:center; }
+  #bar button { background:var(--panel); color:var(--fg); border:1px solid var(--line); border-radius:5px; padding:5px 10px; cursor:pointer; font:inherit; }
+  #bar button:hover { border-color:var(--accent); }
+  #bar button.on { background:#3a2a10; border-color:var(--accent); color:var(--accent); }
+  #touch { display:none; position:absolute; right:10px; bottom:10px; gap:10px; }
+  #touch button { width:70px; height:70px; border-radius:50%; border:2px solid #ffffff55; background:#00000066; color:#fff; font-weight:700; }
+  @media (pointer:coarse) { #touch { display:flex; } }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="c" width="960" height="640"></canvas>
+  <div id="touch"><button id="tSprint">SPRINT</button><button id="tDecoy">DECOY</button></div>
+</div>
+<div id="bar">
+  <button data-act="debug">Debug (F1)</button>
+  <button data-act="mode">Mode: Steering (K)</button>
+  <button data-act="nodes">A* nodes (N)</button>
+  <button data-act="regions">Regions (H)</button>
+  <button data-act="stress">+10 hunters (T)</button>
+  <button data-act="mute">Sound (M)</button>
+  <button data-act="pause">Pause (P)</button>
+  <button data-act="restart">Restart (R)</button>
+</div>
+
+<script>
+'use strict';
+(() => {
+
+/* =====================================================================
+ *  CONFIG — every tunable number lives here (difficulty, weights, ranges)
+ * ===================================================================== */
+const CONFIG = {
+  step: 1 / 60,                                   // fixed simulation timestep (60 Hz)
+  view: { w: 960, h: 640 },
+  world: { tile: 40, cols: 40, rows: 30, region: 10 },   // 1600x1200 px, 10x10-tile regions
+  maxEnemies: 64,
+
+  player: {
+    radius: 11, walk: 150, sprint: 245, accel: 700,
+    stamina: 100, drain: 36, regen: 22, regenDelay: 0.9, recoverAt: 25,
+    hearts: 3, invuln: 1.5,
+    light: 235,
+    walkNoise: 70, sprintNoise: 240,              // radii at which footsteps can be heard
+    decoyCooldown: 6, decoyRadius: 380, decoyLife: 5, decoyRange: 320,
+  },
+
+  objective: { beacons: 5, pickup: 24, extract: 34 },
+
+  // ---- Steering: final = clamp( wGoal*goal + wAvoid*avoid + wSep*separation , maxForce )
+  steer: {
+    wGoal: 1.0, wAvoid: 2.6, wSep: 1.4,
+    feelerBase: 26, feelerSpeed: 0.22, feelerAngle: 0.62, feelerSide: 0.65,
+    sepPadding: 12,
+    wanderDist: 46, wanderRadius: 26, wanderJitter: 0.55,
+    arriveSlow: 110, maxPredict: 0.85, faceSpeed: 12, turnRate: 7,
+    kinematicAvoid: 0.12,                          // avoid/separation influence in kinematic mode
+  },
+
+  // ---- Pathfinding
+  path: {
+    maxPerFrame: 3,                                // K: path requests processed per tick
+    replanMin: 0.4, replanMax: 0.8,                // per-agent replan timer (seconds)
+    targetMoveTiles: 3,                            // replan if target moved > X tiles
+    hierMinDist: 14,                               // below this (tiles) use flat A*
+    smoothRadius: 13,
+    reservePenalty: 9, reserveWindow: 0.7,         // time-aware reservation table
+    waitMax: 0.7,
+  },
+
+  // ---- Enemies (units: px, px/s, rad)
+  enemies: {
+    stalker: { radius: 12, patrol: 70, chase: 188, force: 560, mass: 1, range: 260, fov: 100, sense: 46, attackRange: 70 },
+    flanker: { radius: 12, patrol: 74, chase: 204, force: 600, mass: 1, range: 260, fov: 100, sense: 46, attackRange: 70 },
+    brute:   { radius: 17, patrol: 58, chase: 125, charge: 285, force: 520, mass: 3, range: 240, fov: 90, sense: 50, attackRange: 70,
+               windup: 0.65, chargeMax: 2.2, tired: 1.8 },
+    drone:   { radius: 9,  wander: 85, evade: 205, force: 520, mass: 0.6, sight: 300, evadeDist: 170, calmDist: 260, pingCooldown: 4.5, pingWind: 0.5, pingRadius: 460 },
+  },
+  ai: {
+    attackMix: [['attack', 70], ['reposition', 20], ['retreat', 10]],   // weighted randomness in Chase
+    reactMin: 0.2, reactMax: 0.5,                  // human-like reaction delay
+    aimNoise: 30,                                  // px of prediction error at max range
+    loseInterest: 5,
+    suspiciousThreshold: 0.3,
+    searchFromChase: 6, searchFromNoise: 4,
+    flankDist: 130,
+    slots: [80, -80, 0],                           // degrees around player's heading for flankers
+  },
+  // difficulty per wave: smarter, not just bigger numbers (Complexity Fallacy)
+  wave(w) {
+    return {
+      react: Math.max(0.6, 1.25 - 0.09 * (w - 1)),            // multiplies reaction/awareness time
+      hear: 1 + 0.08 * (w - 1),                               // hearing radius multiplier
+      speed: Math.min(1.14, 1 + 0.025 * (w - 1)),             // tiny speed bump only
+      lose: Math.min(7.5, 5 + 0.25 * (w - 1)),                // memory length
+      coordination: Math.min(1, Math.max(0, (w - 2) / 2)),    // 0 = flankers act alone, 1 = real pincer
+      patrolNodes: 8 + 2 * w,
+      density: Math.min(0.26, 0.10 + 0.016 * w),
+      stalkers: Math.min(2 + w, 9), flankers: Math.min(Math.max(0, w - 1), 7),
+      brutes: w >= 3 ? Math.min(Math.floor((w - 1) / 2), 4) : 0,
+      drones: Math.min(1 + Math.floor(w / 2), 4),
+    };
+  },
+};
+
+/* =====================================================================
+ *  Small pure helpers + Vec2
+ * ===================================================================== */
+const PI = Math.PI;
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const lerp = (a, b, t) => a + (b - a) * t;
+const rand = (a = 1, b) => (b === undefined ? Math.random() * a : a + Math.random() * (b - a));
+const randInt = (a, b) => Math.floor(rand(a, b + 1));
+const angleDiff = (a, b) => { let d = (b - a) % (2 * PI); if (d > PI) d -= 2 * PI; if (d < -PI) d += 2 * PI; return d; };
+const deg = (d) => (d * PI) / 180;
+function weightedPick(items, weightOf) {                      // weighted randomness (uncertainty)
+  let total = 0; const ws = items.map((it) => { const w = Math.max(0, weightOf(it)); total += w; return w; });
+  let r = Math.random() * total;
+  for (let i = 0; i < items.length; i++) { r -= ws[i]; if (r <= 0) return items[i]; }
+  return items[items.length - 1];
+}
+
+class Vec2 {
+  constructor(x = 0, y = 0) { this.x = x; this.y = y; }
+  clone() { return new Vec2(this.x, this.y); }
+  add(v) { return new Vec2(this.x + v.x, this.y + v.y); }
+  sub(v) { return new Vec2(this.x - v.x, this.y - v.y); }
+  mul(s) { return new Vec2(this.x * s, this.y * s); }
+  len() { return Math.hypot(this.x, this.y); }
+  norm() { const l = this.len(); return l > 1e-9 ? new Vec2(this.x / l, this.y / l) : new Vec2(); }
+  clamp(max) { const l = this.len(); return l > max ? this.mul(max / l) : this.clone(); }
+  dist(v) { return Math.hypot(this.x - v.x, this.y - v.y); }
+  dot(v) { return this.x * v.x + this.y * v.y; }
+  perp() { return new Vec2(-this.y, this.x); }
+  rot(a) { const c = Math.cos(a), s = Math.sin(a); return new Vec2(this.x * c - this.y * s, this.x * s + this.y * c); }
+  angle() { return Math.atan2(this.y, this.x); }
+  static fromAngle(a, l = 1) { return new Vec2(Math.cos(a) * l, Math.sin(a) * l); }
+}
+
+/* =====================================================================
+ *  Input — keyboard, mouse, basic touch. "pressed" = edge-triggered.
+ * ===================================================================== */
+class Input {
+  constructor(canvas) {
+    this.canvas = canvas; this.keys = new Set(); this.pressed = new Set();
+    this.mouse = { x: 480, y: 320, clicked: false };
+    this.touch = { id: null, ox: 0, oy: 0, vx: 0, vy: 0, sprint: false };
+    this.anyInput = false;
+    const prevent = new Set(['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'F1', 'Tab']);
+    addEventListener('keydown', (e) => {
+      if (prevent.has(e.code)) e.preventDefault();
+      if (!e.repeat) this.pressed.add(e.code);
+      this.keys.add(e.code); this.anyInput = true;
+    });
+    addEventListener('keyup', (e) => this.keys.delete(e.code));
+    addEventListener('blur', () => this.keys.clear());
+    const pos = (cx, cy) => { const r = canvas.getBoundingClientRect(); return [(cx - r.left) * (canvas.width / r.width), (cy - r.top) * (canvas.height / r.height)]; };
+    canvas.addEventListener('mousemove', (e) => { [this.mouse.x, this.mouse.y] = pos(e.clientX, e.clientY); });
+    canvas.addEventListener('mousedown', (e) => { [this.mouse.x, this.mouse.y] = pos(e.clientX, e.clientY); this.mouse.clicked = true; this.anyInput = true; });
+    canvas.addEventListener('touchstart', (e) => {
+      e.preventDefault(); this.anyInput = true;
+      const t = e.changedTouches[0]; const [x, y] = pos(t.clientX, t.clientY);
+      if (this.touch.id === null) { this.touch.id = t.identifier; this.touch.ox = x; this.touch.oy = y; }
+      this.mouse.clicked = true; this.mouse.x = x; this.mouse.y = y;
+    }, { passive: false });
+    canvas.addEventListener('touchmove', (e) => {
+      e.preventDefault();
+      for (const t of e.changedTouches) if (t.identifier === this.touch.id) {
+        const [x, y] = pos(t.clientX, t.clientY);
+        const dx = x - this.touch.ox, dy = y - this.touch.oy, l = Math.hypot(dx, dy);
+        this.touch.vx = l > 10 ? dx / Math.max(l, 60) : 0; this.touch.vy = l > 10 ? dy / Math.max(l, 60) : 0;
+      }
+    }, { passive: false });
+    const end = (e) => { for (const t of e.changedTouches) if (t.identifier === this.touch.id) { this.touch.id = null; this.touch.vx = this.touch.vy = 0; } };
+    canvas.addEventListener('touchend', end); canvas.addEventListener('touchcancel', end);
+    const tS = document.getElementById('tSprint'), tD = document.getElementById('tDecoy');
+    tS.addEventListener('touchstart', (e) => { e.preventDefault(); this.touch.sprint = true; this.anyInput = true; }, { passive: false });
+    tS.addEventListener('touchend', () => { this.touch.sprint = false; });
+    tD.addEventListener('touchstart', (e) => { e.preventDefault(); this.pressed.add('KeyE'); this.anyInput = true; }, { passive: false });
+  }
+  down(code) { return this.keys.has(code); }
+  consume(code) { return this.pressed.delete(code); }
+  consumeClick() { const c = this.mouse.clicked; this.mouse.clicked = false; return c; }
+  axis() {
+    let x = 0, y = 0;
+    if (this.down('KeyA') || this.down('ArrowLeft')) x -= 1;
+    if (this.down('KeyD') || this.down('ArrowRight')) x += 1;
+    if (this.down('KeyW') || this.down('ArrowUp')) y -= 1;
+    if (this.down('KeyS') || this.down('ArrowDown')) y += 1;
+    x += this.touch.vx; y += this.touch.vy;
+    const v = new Vec2(x, y); return v.len() > 1 ? v.norm() : v;
+  }
+  sprinting() { return this.down('ShiftLeft') || this.down('ShiftRight') || this.touch.sprint; }
+  endFrame() { this.pressed.clear(); this.mouse.clicked = false; }
+}
+
+/* =====================================================================
+ *  Sfx — procedural Web Audio (no assets). Started after first interaction.
+ * ===================================================================== */
+const Sfx = {
+  ctx: null, master: null, muted: false, last: {},
+  init() {
+    if (this.ctx) { if (this.ctx.state === 'suspended') this.ctx.resume(); return; }
+    try { this.ctx = new (window.AudioContext || window.webkitAudioContext)(); this.master = this.ctx.createGain(); this.master.gain.value = this.muted ? 0 : 0.5; this.master.connect(this.ctx.destination); } catch (e) { this.ctx = null; }
+  },
+  setMuted(m) { this.muted = m; if (this.master) this.master.gain.value = m ? 0 : 0.5; },
+  tone(f, dur, type = 'sine', vol = 0.2, slide = 0, delay = 0) {
+    if (!this.ctx) return; const t = this.ctx.currentTime + delay;
+    const o = this.ctx.createOscillator(), g = this.ctx.createGain();
+    o.type = type; o.frequency.setValueAtTime(f, t); if (slide) o.frequency.exponentialRampToValueAtTime(Math.max(20, f + slide), t + dur);
+    g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g); g.connect(this.master); o.start(t); o.stop(t + dur + 0.02);
+  },
+  noise(dur, vol = 0.1, freq = 800) {
+    if (!this.ctx) return; const t = this.ctx.currentTime, n = Math.floor(this.ctx.sampleRate * dur);
+    const buf = this.ctx.createBuffer(1, n, this.ctx.sampleRate), d = buf.getChannelData(0);
+    for (let i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / n);
+    const s = this.ctx.createBufferSource(), f = this.ctx.createBiquadFilter(), g = this.ctx.createGain();
+    s.buffer = buf; f.type = 'lowpass'; f.frequency.value = freq; g.gain.value = vol;
+    s.connect(f); f.connect(g); g.connect(this.master); s.start(t);
+  },
+  once(name, gap, fn) { const now = performance.now(); if (now - (this.last[name] || 0) < gap) return; this.last[name] = now; fn(); },
+  step(sprint) { this.once('step', sprint ? 150 : 260, () => this.noise(0.05, sprint ? 0.12 : 0.05, sprint ? 1400 : 700)); },
+  suspicious() { this.once('sus', 400, () => this.tone(520, 0.18, 'triangle', 0.12, 120)); },
+  alert() { this.once('alert', 300, () => { this.tone(880, 0.14, 'square', 0.1, -300); this.tone(660, 0.18, 'square', 0.1, -200, 0.1); }); },
+  ping() { this.once('ping', 300, () => this.tone(1200, 0.35, 'sine', 0.12, -500)); },
+  beacon() { this.tone(660, 0.12, 'triangle', 0.18); this.tone(990, 0.25, 'triangle', 0.18, 0, 0.1); },
+  open() { [440, 554, 659, 880].forEach((f, i) => this.tone(f, 0.3, 'triangle', 0.15, 0, i * 0.1)); },
+  hit() { this.noise(0.25, 0.3, 500); this.tone(110, 0.3, 'sawtooth', 0.25, -60); },
+  decoy() { this.tone(300, 0.2, 'square', 0.1, 400); },
+  win() { [523, 659, 784, 1046].forEach((f, i) => this.tone(f, 0.25, 'triangle', 0.18, 0, i * 0.09)); },
+  lose() { [330, 262, 196, 131].forEach((f, i) => this.tone(f, 0.4, 'sawtooth', 0.2, 0, i * 0.18)); },
+};
+
+/* =====================================================================
+ *  World / Grid — tile map, collision, ray casting, procedural arena
+ *  (Concept support: the navigation graph that A* runs on.)
+ * ===================================================================== */
+const NO_HIT = Object.freeze({ hit: false, t: 1, nx: 0, ny: 0, x: 0, y: 0 });
+
+class Grid {
+  constructor() {
+    const { cols, rows, tile } = CONFIG.world;
+    this.cols = cols; this.rows = rows; this.tile = tile; this.w = cols * tile; this.h = rows * tile;
+    this.walls = new Uint8Array(cols * rows);
+    this.choke = new Uint8Array(cols * rows);   // 1-tile-wide passages (used by the reservation table)
+  }
+  idx(cx, cy) { return cy * this.cols + cx; }
+  cx(i) { return i % this.cols; }
+  cy(i) { return (i / this.cols) | 0; }
+  isWall(cx, cy) { return cx < 0 || cy < 0 || cx >= this.cols || cy >= this.rows || this.walls[cy * this.cols + cx] === 1; }
+  cellOf(p) { return this.idx(clamp(Math.floor(p.x / this.tile), 0, this.cols - 1), clamp(Math.floor(p.y / this.tile), 0, this.rows - 1)); }
+  center(i) { return new Vec2((this.cx(i) + 0.5) * this.tile, (this.cy(i) + 0.5) * this.tile); }
+  isWallAt(p) { return this.isWall(Math.floor(p.x / this.tile), Math.floor(p.y / this.tile)); }
+
+  computeChokes() {
+    this.choke.fill(0);
+    for (let y = 1; y < this.rows - 1; y++) for (let x = 1; x < this.cols - 1; x++) {
+      if (this.isWall(x, y)) continue;
+      if ((this.isWall(x - 1, y) && this.isWall(x + 1, y)) || (this.isWall(x, y - 1) && this.isWall(x, y + 1))) this.choke[this.idx(x, y)] = 1;
+    }
+  }
+
+  /** Amanatides-Woo grid traversal. Returns first wall hit along the segment, with surface normal. */
+  raycast(x0, y0, x1, y1) {
+    const T = this.tile; let cx = Math.floor(x0 / T), cy = Math.floor(y0 / T);
+    if (this.isWall(cx, cy)) return { hit: true, t: 0, nx: 0, ny: 0, x: x0, y: y0 };
+    const dx = x1 - x0, dy = y1 - y0;
+    const sx = dx > 0 ? 1 : -1, sy = dy > 0 ? 1 : -1;
+    const tdx = dx !== 0 ? Math.abs(T / dx) : Infinity, tdy = dy !== 0 ? Math.abs(T / dy) : Infinity;
+    let tmx = dx !== 0 ? ((dx > 0 ? (cx + 1) * T - x0 : x0 - cx * T) / Math.abs(dx)) : Infinity;
+    let tmy = dy !== 0 ? ((dy > 0 ? (cy + 1) * T - y0 : y0 - cy * T) / Math.abs(dy)) : Infinity;
+    for (let guard = 0; guard < 200; guard++) {
+      let t, nx = 0, ny = 0;
+      if (tmx < tmy) { t = tmx; if (t > 1) break; cx += sx; tmx += tdx; nx = -sx; }
+      else { t = tmy; if (t > 1) break; cy += sy; tmy += tdy; ny = -sy; }
+      if (this.isWall(cx, cy)) return { hit: true, t, nx, ny, x: x0 + dx * t, y: y0 + dy * t };
+    }
+    return NO_HIT;
+  }
+  los(a, b) { return !this.raycast(a.x, a.y, b.x, b.y).hit; }
+  /** "Thick" line of sight: three parallel rays so a body of radius r fits (used for smoothing/look-ahead). */
+  clearLine(a, b, r) {
+    if (!this.los(a, b)) return false;
+    const d = b.sub(a); if (d.len() < 1) return true;
+    const n = d.norm().perp().mul(r);
+    return this.los(a.add(n), b.add(n)) && this.los(a.sub(n), b.sub(n));
+  }
+  /** Push a circle out of wall tiles (collision response). Mutates p. Returns true if touched a wall. */
+  resolveCircle(p, r) {
+    const T = this.tile; let hit = false;
+    for (let pass = 0; pass < 2; pass++) {
+      const x0 = Math.floor((p.x - r) / T), x1 = Math.floor((p.x + r) / T), y0 = Math.floor((p.y - r) / T), y1 = Math.floor((p.y + r) / T);
+      for (let cy = y0; cy <= y1; cy++) for (let cx = x0; cx <= x1; cx++) {
+        if (!this.isWall(cx, cy)) continue;
+        const rx = cx * T, ry = cy * T, nx = clamp(p.x, rx, rx + T), ny = clamp(p.y, ry, ry + T);
+        const dx = p.x - nx, dy = p.y - ny, d2 = dx * dx + dy * dy;
+        if (d2 >= r * r) continue;
+        hit = true;
+        if (d2 > 1e-6) { const d = Math.sqrt(d2); p.x += (dx / d) * (r - d); p.y += (dy / d) * (r - d); }
+        else {
+          const l = p.x - rx, rr = rx + T - p.x, t = p.y - ry, b = ry + T - p.y, m = Math.min(l, rr, t, b);
+          if (m === l) p.x = rx - r; else if (m === rr) p.x = rx + T + r; else if (m === t) p.y = ry - r; else p.y = ry + T + r;
+        }
+      }
+    }
+    return hit;
+  }
+  nearestFree(p) {
+    let cx = clamp(Math.floor(p.x / this.tile), 0, this.cols - 1), cy = clamp(Math.floor(p.y / this.tile), 0, this.rows - 1);
+    if (!this.isWall(cx, cy)) return this.idx(cx, cy);
+    for (let r = 1; r < 8; r++) for (let y = cy - r; y <= cy + r; y++) for (let x = cx - r; x <= cx + r; x++)
+      if (Math.max(Math.abs(x - cx), Math.abs(y - cy)) === r && !this.isWall(x, y)) return this.idx(x, y);
+    return this.idx(1, 1);
+  }
+  isOpen(cx, cy) {                       // free cell whose 8 neighbours are free too (safe for spawning)
+    for (let y = -1; y <= 1; y++) for (let x = -1; x <= 1; x++) if (this.isWall(cx + x, cy + y)) return false;
+    return true;
+  }
+}
+
+/** Procedural arena: ruined buildings with 1-tile doors (chokepoints) + rock blobs. Regenerates until connected. */
+function buildArena(wave) {
+  const W = CONFIG.world, d = CONFIG.wave(wave);
+  const corners = [[4, 4], [W.cols - 5, 4], [4, W.rows - 5], [W.cols - 5, W.rows - 5]];
+  let best = null;
+  for (let attempt = 0; attempt < 60; attempt++) {
+    const g = new Grid();
+    const set = (x, y, v = 1) => { if (x >= 0 && y >= 0 && x < g.cols && y < g.rows) g.walls[g.idx(x, y)] = v; };
+    for (let x = 0; x < g.cols; x++) { set(x, 0); set(x, g.rows - 1); }
+    for (let y = 0; y < g.rows; y++) { set(0, y); set(g.cols - 1, y); }
+    const [sx, sy] = corners[randInt(0, 3)];
+    const inStart = (x, y) => Math.abs(x - sx) <= 4 && Math.abs(y - sy) <= 4;
+    const areaFree = (x0, y0, w, h, margin) => {
+      for (let y = y0 - margin; y < y0 + h + margin; y++) for (let x = x0 - margin; x < x0 + w + margin; x++) if (g.isWall(x, y) && !(x <= 0 || y <= 0 || x >= g.cols - 1 || y >= g.rows - 1)) return false;
+      return true;
+    };
+    const nRuins = 5 + Math.min(wave, 4);
+    for (let i = 0, tries = 0; i < nRuins && tries < 200; tries++) {
+      const w = randInt(5, 9), h = randInt(4, 7), x = randInt(2, g.cols - w - 3), y = randInt(2, g.rows - h - 3);
+      let overlapStart = false;
+      for (let yy = y; yy < y + h && !overlapStart; yy++) for (let xx = x; xx < x + w; xx++) if (inStart(xx, yy)) { overlapStart = true; break; }
+      if (overlapStart || !areaFree(x, y, w, h, 2)) continue;
+      for (let xx = x; xx < x + w; xx++) { set(xx, y); set(xx, y + h - 1); }
+      for (let yy = y; yy < y + h; yy++) { set(x, yy); set(x + w - 1, yy); }
+      for (let k = randInt(1, 3); k > 0; k--) {          // 1-tile doors => chokepoints
+        const side = randInt(0, 3);
+        if (side === 0) set(randInt(x + 1, x + w - 2), y, 0); else if (side === 1) set(randInt(x + 1, x + w - 2), y + h - 1, 0);
+        else if (side === 2) set(x, randInt(y + 1, y + h - 2), 0); else set(x + w - 1, randInt(y + 1, y + h - 2), 0);
+      }
+      i++;
+    }
+    const total = g.cols * g.rows; let walls = g.walls.reduce((a, b) => a + b, 0);
+    for (let tries = 0; walls / total < d.density && tries < 800; tries++) {
+      const w = randInt(1, 3), h = randInt(1, 3), x = randInt(2, g.cols - w - 3), y = randInt(2, g.rows - h - 3);
+      let bad = false;
+      for (let yy = y - 1; yy <= y + h && !bad; yy++) for (let xx = x - 1; xx <= x + w; xx++) if (inStart(xx, yy)) { bad = true; break; }
+      if (bad) continue;
+      for (let yy = y; yy < y + h; yy++) for (let xx = x; xx < x + w; xx++) if (!g.isWall(xx, yy)) { set(xx, yy); walls++; }
+    }
+    // Guaranteed connectivity: 4-connected flood fill from the player start (matches "no corner cutting")
+    const reach = new Uint8Array(total), stack = [g.idx(sx, sy)]; reach[stack[0]] = 1; let nReach = 0;
+    while (stack.length) {
+      const i = stack.pop(); nReach++; const x = g.cx(i), y = g.cy(i);
+      for (const [ox, oy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) { const nx = x + ox, ny = y + oy; if (!g.isWall(nx, ny) && !reach[g.idx(nx, ny)]) { reach[g.idx(nx, ny)] = 1; stack.push(g.idx(nx, ny)); } }
+    }
+    let free = 0; for (let i = 0; i < total; i++) if (!g.walls[i]) free++;
+    best = { g, reach, start: new Vec2((sx + 0.5) * g.tile, (sy + 0.5) * g.tile), disconnected: free - nReach };
+    if (free === nReach) break;
+    if (attempt === 59) for (let i = 0; i < total; i++) if (!g.walls[i] && !reach[i]) g.walls[i] = 1;   // last resort: wall off pockets
+  }
+  best.g.computeChokes();
+  return best;
+}
+
+/* =====================================================================
+ *  Pathfinding — A* (binary heap, typed arrays), RegionGraph (hierarchical),
+ *  ReservationTable (time-aware), PathService (request queue + local replan)
+ * ===================================================================== */
+class BinaryHeap {
+  constructor() { this.ids = []; this.fs = []; }
+  get size() { return this.ids.length; }
+  clear() { this.ids.length = 0; this.fs.length = 0; }
+  push(id, f) {
+    let i = this.ids.length; this.ids.push(id); this.fs.push(f);
+    while (i > 0) { const p = (i - 1) >> 1; if (this.fs[p] <= f) break; this.ids[i] = this.ids[p]; this.fs[i] = this.fs[p]; i = p; }
+    this.ids[i] = id; this.fs[i] = f;
+  }
+  pop() {
+    const top = this.ids[0], lastId = this.ids.pop(), lastF = this.fs.pop(), n = this.ids.length;
+    if (n > 0) {
+      let i = 0;
+      for (;;) {
+        let c = 2 * i + 1; if (c >= n) break;
+        if (c + 1 < n && this.fs[c + 1] < this.fs[c]) c++;
+        if (this.fs[c] >= lastF) break;
+        this.ids[i] = this.ids[c]; this.fs[i] = this.fs[c]; i = c;
+      }
+      this.ids[i] = lastId; this.fs[i] = lastF;
+    }
+    return top;
+  }
+}
+
+const DIRS = [[1, 0, 1], [-1, 0, 1], [0, 1, 1], [0, -1, 1], [1, 1, Math.SQRT2], [1, -1, Math.SQRT2], [-1, 1, Math.SQRT2], [-1, -1, Math.SQRT2]];
+
+/** A* on the tile grid: 8-directional, no corner cutting, octile heuristic, binary-heap open list, typed-array closed set. */
+class AStar {
+  constructor(grid) {
+    this.grid = grid; const n = grid.cols * grid.rows;
+    this.g = new Float32Array(n); this.parent = new Int32Array(n); this.seen = new Uint32Array(n); this.closed = new Uint32Array(n);
+    this.stamp = 0; this.heap = new BinaryHeap(); this.expanded = 0;
+    this.traceOn = false; this.traceClosed = []; this.traceOpen = [];
+  }
+  h(a, b) { const dx = Math.abs(this.grid.cx(a) - this.grid.cx(b)), dy = Math.abs(this.grid.cy(a) - this.grid.cy(b)); return Math.max(dx, dy) + (Math.SQRT2 - 1) * Math.min(dx, dy); }
+  /** goal = -1 → Dijkstra flood (used to price intra-region portal links). opts: {bounds, ctx, trace} */
+  search(start, goal, opts = {}) {
+    const G = this.grid, b = opts.bounds || { x0: 0, y0: 0, x1: G.cols - 1, y1: G.rows - 1 }, ctx = opts.ctx;
+    const st = ++this.stamp; this.expanded = 0; const heap = this.heap; heap.clear();
+    const tracing = this.traceOn && opts.trace; if (tracing) { this.traceClosed = []; this.traceOpen = []; }
+    this.g[start] = 0; this.parent[start] = -1; this.seen[start] = st;
+    heap.push(start, goal >= 0 ? this.h(start, goal) : 0);
+    let found = false;
+    while (heap.size) {
+      const cur = heap.pop();
+      if (this.closed[cur] === st) continue;
+      this.closed[cur] = st; this.expanded++; if (tracing) this.traceClosed.push(cur);
+      if (cur === goal) { found = true; break; }
+      const cx = G.cx(cur), cy = G.cy(cur);
+      for (let k = 0; k < 8; k++) {
+        const [ox, oy, c] = DIRS[k], nx = cx + ox, ny = cy + oy;
+        if (nx < b.x0 || nx > b.x1 || ny < b.y0 || ny > b.y1 || G.isWall(nx, ny)) continue;
+        if (ox !== 0 && oy !== 0 && (G.isWall(cx + ox, cy) || G.isWall(cx, cy + oy))) continue;      // no corner cutting
+        const ni = G.idx(nx, ny); if (this.closed[ni] === st) continue;
+        let step = c;
+        if (ctx && G.choke[ni]) step += ctx.resv.penalty(ni, ctx.now + ((this.g[cur] + c) * G.tile) / ctx.speed, ctx.id);   // time-aware cost
+        const ng = this.g[cur] + step;
+        if (this.seen[ni] !== st || ng < this.g[ni]) { this.g[ni] = ng; this.parent[ni] = cur; this.seen[ni] = st; heap.push(ni, ng + (goal >= 0 ? this.h(ni, goal) : 0)); }
+      }
+    }
+    if (tracing) this.traceOpen = Array.from(new Set(heap.ids.filter((i) => this.closed[i] !== st)));
+    if (goal < 0 || !found) return null;
+    const cells = []; for (let c = goal; c !== -1; c = this.parent[c]) cells.push(c);
+    return cells.reverse();
+  }
+  costOf(i) { return this.closed[i] === this.stamp ? this.g[i] : Infinity; }   // valid right after a flood
+}
+
+/** String pulling: drop waypoints whenever a body-width line of sight exists to a farther one. */
+function smoothPath(grid, cells, radius) {
+  const pts = cells.map((c) => grid.center(c)); if (pts.length < 3) return pts;
+  const out = [pts[0]]; let i = 0;
+  while (i < pts.length - 1) { let j = pts.length - 1; while (j > i + 1 && !grid.clearLine(pts[i], pts[j], radius)) j--; out.push(pts[j]); i = j; }
+  return out;
+}
+
+/** Hierarchical pathfinding: 10x10-tile regions, portals on shared borders, abstract graph with intra-region costs. */
+class RegionGraph {
+  constructor(grid, astar) {
+    this.grid = grid; this.astar = astar; this.rs = CONFIG.world.region;
+    this.rc = Math.ceil(grid.cols / this.rs); this.rr = Math.ceil(grid.rows / this.rs);
+    this.nodes = []; this.byRegion = Array.from({ length: this.rc * this.rr }, () => []);
+    this.build();
+  }
+  regionOf(cell) { return Math.floor(this.grid.cy(cell) / this.rs) * this.rc + Math.floor(this.grid.cx(cell) / this.rs); }
+  bounds(r) { const x = (r % this.rc) * this.rs, y = Math.floor(r / this.rc) * this.rs; return { x0: x, y0: y, x1: Math.min(x + this.rs, this.grid.cols) - 1, y1: Math.min(y + this.rs, this.grid.rows) - 1 }; }
+  union(a, b) { return { x0: Math.min(a.x0, b.x0), y0: Math.min(a.y0, b.y0), x1: Math.max(a.x1, b.x1), y1: Math.max(a.y1, b.y1) }; }
+  addPortal(ca, cb) {
+    const a = this.nodes.length, b = a + 1;
+    this.nodes.push({ cell: ca, region: this.regionOf(ca), links: [{ to: b, cost: 1, inter: true }] });
+    this.nodes.push({ cell: cb, region: this.regionOf(cb), links: [{ to: a, cost: 1, inter: true }] });
+    this.byRegion[this.nodes[a].region].push(a); this.byRegion[this.nodes[b].region].push(b);
+  }
+  build() {
+    const G = this.grid, rs = this.rs;
+    const scan = (pairs) => {                       // pairs: array of [cellA, cellB] along one border → entrances
+      let run = [];
+      const flush = () => {
+        if (!run.length) return;
+        if (run.length <= 5) { const m = run[run.length >> 1]; this.addPortal(m[0], m[1]); }
+        else { this.addPortal(run[0][0], run[0][1]); this.addPortal(run[run.length - 1][0], run[run.length - 1][1]); }
+        run = [];
+      };
+      for (const p of pairs) { if (p) run.push(p); else flush(); } flush();
+    };
+    for (let ry = 0; ry < this.rr; ry++) for (let rx = 0; rx < this.rc; rx++) {
+      if (rx + 1 < this.rc) { const x = (rx + 1) * rs - 1, pr = []; for (let y = ry * rs; y < Math.min((ry + 1) * rs, G.rows); y++) pr.push(!G.isWall(x, y) && !G.isWall(x + 1, y) ? [G.idx(x, y), G.idx(x + 1, y)] : null); scan(pr); }
+      if (ry + 1 < this.rr) { const y = (ry + 1) * rs - 1, pr = []; for (let x = rx * rs; x < Math.min((rx + 1) * rs, G.cols); x++) pr.push(!G.isWall(x, y) && !G.isWall(x, y + 1) ? [G.idx(x, y), G.idx(x, y + 1)] : null); scan(pr); }
+    }
+    for (let r = 0; r < this.byRegion.length; r++) {      // intra-region edges: one flood per portal, bounded to the region
+      const ids = this.byRegion[r], bd = this.bounds(r);
+      for (const a of ids) {
+        this.astar.search(this.nodes[a].cell, -1, { bounds: bd });
+        for (const b of ids) if (a !== b) { const c = this.astar.costOf(this.nodes[b].cell); if (c < Infinity) this.nodes[a].links.push({ to: b, cost: c, inter: false }); }
+      }
+    }
+  }
+  /** High-level A*: returns {steps:[{from,to}], regions:[...], expanded} or null. */
+  findRoute(s, g) {
+    const A = this.astar, sr = this.regionOf(s), gr = this.regionOf(g), N = this.nodes.length, S = N, GOAL = N + 1;
+    let expanded = 0;
+    A.search(s, -1, { bounds: this.bounds(sr) }); expanded += A.expanded;
+    const startEdges = []; for (const n of this.byRegion[sr]) { const c = A.costOf(this.nodes[n].cell); if (c < Infinity) startEdges.push({ to: n, cost: c, inter: false }); }
+    A.search(g, -1, { bounds: this.bounds(gr) }); expanded += A.expanded;
+    const goalCost = new Map(); for (const n of this.byRegion[gr]) { const c = A.costOf(this.nodes[n].cell); if (c < Infinity) goalCost.set(n, c); }
+    if (!startEdges.length || !goalCost.size) return null;
+    const dist = new Map([[S, 0]]), parent = new Map(), closed = new Set(), heap = new BinaryHeap();
+    const hc = (n) => { const c = this.nodes[n].cell; return Math.hypot(this.grid.cx(c) - this.grid.cx(g), this.grid.cy(c) - this.grid.cy(g)); };
+    heap.push(S, 0);
+    while (heap.size) {
+      const u = heap.pop(); if (closed.has(u)) continue; closed.add(u); expanded++;
+      if (u === GOAL) break;
+      const edges = u === S ? startEdges : this.nodes[u].links;
+      const du = dist.get(u);
+      const relax = (v, cost) => { const nd = du + cost; if (!dist.has(v) || nd < dist.get(v)) { dist.set(v, nd); parent.set(v, u); heap.push(v, nd + (v === GOAL ? 0 : hc(v))); } };
+      for (const e of edges) relax(e.to, e.cost);
+      if (u !== S && goalCost.has(u)) relax(GOAL, goalCost.get(u));
+    }
+    if (!parent.has(GOAL)) return null;
+    const seq = []; for (let u = GOAL; u !== S; u = parent.get(u)) seq.push(u); seq.reverse();
+    seq.pop();                                   // drop GOAL marker
+    const steps = [], regions = [sr];
+    for (let i = 0; i + 1 < seq.length; i++) {
+      const a = this.nodes[seq[i]], b = this.nodes[seq[i + 1]];
+      if (a.region !== b.region) { steps.push({ from: a.cell, to: b.cell }); regions.push(b.region); }
+    }
+    return { steps, regions, expanded };
+  }
+}
+
+/** Time-aware planning: chokepoint cells are reserved for the time a planned agent will be there; later planners pay a penalty. */
+class ReservationTable {
+  constructor() { this.map = new Map(); this.waits = 0; }
+  reserve(id, cell, t0, t1) { let l = this.map.get(cell); if (!l) this.map.set(cell, (l = [])); l.push({ id, t0, t1 }); }
+  penalty(cell, t, id) {
+    const l = this.map.get(cell); if (!l) return 0; const w = CONFIG.path.reserveWindow;
+    for (const r of l) if (r.id !== id && t > r.t0 - w && t < r.t1 + w) return CONFIG.path.reservePenalty;
+    return 0;
+  }
+  holder(cell, t, id) {                          // who else holds this cell around time t?
+    const l = this.map.get(cell); if (!l) return null;
+    for (const r of l) if (r.id !== id && t >= r.t0 - 0.2 && t <= r.t1) return r;
+    return null;
+  }
+  releaseAgent(id) { for (const [c, l] of this.map) { const f = l.filter((r) => r.id !== id); if (f.length) this.map.set(c, f); else this.map.delete(c); } }
+  cleanup(now) { for (const [c, l] of this.map) { const f = l.filter((r) => r.t1 > now - 0.5); if (f.length) this.map.set(c, f); else this.map.delete(c); } }
+  get size() { return this.map.size; }
+}
+
+/** Global path-request queue: at most K requests per tick, priority-ordered; plus hierarchical refinement & local repair. */
+class PathService {
+  constructor(game) {
+    this.game = game; this.queue = []; this.perTick = 0; this.peak = 0; this.hist = new Array(60).fill(0); this.hp = 0;
+    this.stats = { flat: 0, hierTotal: 0, lastFlat: 0, lastRoute: null, replansTimer: 0, replansMoved: 0, replansBlocked: 0, requests: 0, ms: 0, queueMax: 0, hierPlans: 0, flatPlans: 0, repairs: 0 };
+  }
+  get grid() { return this.game.grid; }
+  request(agent, goal, priority, kind = 'plan') {
+    if (agent.pending && agent.pending.kind === kind) { agent.pending.goal = goal.clone(); agent.pending.priority = Math.min(agent.pending.priority, priority); return; }
+    if (agent.pending && kind === 'plan') this.queue.splice(this.queue.indexOf(agent.pending), 1);
+    const req = { agent, goal: goal.clone(), priority, kind, t: this.game.time };
+    if (kind === 'plan') agent.pending = req; else if (!agent.pending) agent.pending = req;
+    this.queue.push(req); this.stats.queueMax = Math.max(this.stats.queueMax, this.queue.length);
+  }
+  cancel(agent) { if (agent.pending) { const i = this.queue.indexOf(agent.pending); if (i >= 0) this.queue.splice(i, 1); agent.pending = null; } }
+  processFrame() {
+    const t0 = performance.now(); let n = 0;
+    while (n < CONFIG.path.maxPerFrame && this.queue.length) {
+      let bi = 0; for (let i = 1; i < this.queue.length; i++) { const a = this.queue[i], b = this.queue[bi]; if (a.priority < b.priority || (a.priority === b.priority && a.t < b.t)) bi = i; }
+      const req = this.queue.splice(bi, 1)[0]; if (req.agent.pending === req) req.agent.pending = null;
+      if (!req.agent.dead) this.execute(req); n++;
+    }
+    this.perTick = n; this.stats.requests += n; this.peak = Math.max(this.peak, n); this.hist[this.hp++ % 60] = n;
+    this.stats.ms = lerp(this.stats.ms, performance.now() - t0, 0.05);
+  }
+  ctxFor(a) { return { resv: this.game.resv, now: this.game.time, speed: Math.max(60, a.maxSpeed * 0.85), id: a.id }; }
+  execute(req) {
+    const a = req.agent;
+    if (req.kind === 'refine') return this.refine(a);
+    if (req.kind === 'repair') return this.repair(a, req.goal);
+    this.plan(a, req.goal);
+  }
+  plan(a, goalPos) {
+    const G = this.grid, A = this.game.astar, R = this.game.regions, s = G.nearestFree(a.pos), e = G.nearestFree(goalPos);
+    const dbg = this.game.debug.on, ctx = this.ctxFor(a), dx = Math.abs(G.cx(s) - G.cx(e)), dy = Math.abs(G.cy(s) - G.cy(e));
+    a.route = null; a.regionRoute = null; a.pathGoal = goalPos.clone(); a.replanTimer = rand(CONFIG.path.replanMin, CONFIG.path.replanMax);
+    if (s === e) { a.setPath([G.center(e)]); return; }
+    if (Math.max(dx, dy) >= CONFIG.path.hierMinDist && R.regionOf(s) !== R.regionOf(e)) {
+      const route = R.findRoute(s, e);
+      if (route) {
+        this.stats.hierPlans++;
+        a.route = { steps: route.steps, i: 0, goal: e, done: false, expanded: route.expanded };
+        a.regionRoute = route.regions; this.stats.lastRoute = a.route; this.stats.lastFlat = 0;
+        if (dbg) { A.search(s, e); this.stats.lastFlat = A.expanded; }   // comparison run, debug mode only
+        a.path = []; a.pi = 0; this.refine(a, s); return;
+      }
+    }
+    this.stats.flatPlans++;
+    const cells = A.search(s, e, { ctx, trace: true });
+    this.stats.flat = A.expanded; this.stats.lastFlat = A.expanded; this.stats.lastRoute = { expanded: A.expanded, flat: true };
+    if (!cells) { a.setPath([]); return; }
+    this.reserveAlong(a, cells, ctx);
+    a.setPath(smoothPath(G, cells, CONFIG.path.smoothRadius).slice(1));
+  }
+  /** Lazy refinement: detailed A* only inside the current + next region, towards the next portal (or the goal). */
+  refine(a, fromCell) {
+    const r = a.route; if (!r || r.done) return;
+    const G = this.grid, A = this.game.astar, R = this.game.regions;
+    const cur = fromCell !== undefined ? fromCell : G.cellOf(a.path.length ? a.path[a.path.length - 1] : a.pos);
+    const target = r.i < r.steps.length ? r.steps[r.i].to : r.goal;
+    r.i++; if (r.i > r.steps.length) r.done = true;
+    const ctx = this.ctxFor(a); let cells = A.search(cur, target, { bounds: R.union(R.bounds(R.regionOf(cur)), R.bounds(R.regionOf(target))), ctx, trace: true });
+    if (!cells) cells = A.search(cur, target, { ctx });                      // fallback: unbounded
+    r.expanded += A.expanded; this.stats.hierTotal += A.expanded;
+    if (!cells) { r.done = true; return; }
+    this.reserveAlong(a, cells, ctx);
+    a.appendPath(smoothPath(G, cells, CONFIG.path.smoothRadius).slice(1));
+  }
+  /** Local replanning: patch only the next few waypoints instead of recomputing the whole route. */
+  repair(a, _) {
+    this.stats.repairs++;
+    if (a.pi >= a.path.length) return;
+    const G = this.grid, A = this.game.astar, k = Math.min(a.pi + 2, a.path.length - 1);
+    const s = G.nearestFree(a.pos), e = G.cellOf(a.path[k]);
+    const pad = 6, b = { x0: Math.max(0, Math.min(G.cx(s), G.cx(e)) - pad), y0: Math.max(0, Math.min(G.cy(s), G.cy(e)) - pad), x1: Math.min(G.cols - 1, Math.max(G.cx(s), G.cx(e)) + pad), y1: Math.min(G.rows - 1, Math.max(G.cy(s), G.cy(e)) + pad) };
+    const cells = A.search(s, e, { bounds: b, ctx: this.ctxFor(a), trace: true });
+    if (!cells) { if (a.pathGoal) this.request(a, a.pathGoal, 1); return; }
+    a.path.splice(a.pi, k - a.pi + 1, ...smoothPath(G, cells, CONFIG.path.smoothRadius).slice(1));
+  }
+  reserveAlong(a, cells, ctx) {
+    const G = this.grid; let d = 0;
+    for (let i = 0; i < cells.length; i++) {
+      if (i > 0) d += Math.hypot(G.cx(cells[i]) - G.cx(cells[i - 1]), G.cy(cells[i]) - G.cy(cells[i - 1])) * G.tile;
+      if (G.choke[cells[i]]) { const t = ctx.now + d / ctx.speed; this.game.resv.reserve(a.id, cells[i], t - 0.25, t + 0.45); }
+    }
+  }
+}
+
+/* =====================================================================
+ *  Steering behaviours — pure functions returning a steering force
+ *  (= desiredVelocity - currentVelocity). Blended with weights in Agent.
+ * ===================================================================== */
+const Steering = {
+  seek(a, t) { return t.sub(a.pos).norm().mul(a.maxSpeed).sub(a.vel); },
+  flee(a, t) { return a.pos.sub(t).norm().mul(a.maxSpeed).sub(a.vel); },
+  arrive(a, t, slow = CONFIG.steer.arriveSlow) {                    // seek that slows inside the slowing radius
+    const off = t.sub(a.pos), d = off.len(); if (d < 1) return a.vel.mul(-1);
+    return off.mul((a.maxSpeed * Math.min(1, d / slow)) / d).sub(a.vel);
+  },
+  pursue(a, tPos, tVel, err) {                                       // seek where the target WILL be (+ imperfect aim)
+    const T = clamp(tPos.dist(a.pos) / Math.max(a.maxSpeed, 1), 0, CONFIG.steer.maxPredict);
+    const pred = tPos.add(tVel.mul(T)); if (err) { pred.x += err.x; pred.y += err.y; }
+    a.predicted = pred; return Steering.seek(a, pred);
+  },
+  evade(a, tPos, tVel) {
+    const T = clamp(tPos.dist(a.pos) / Math.max(a.maxSpeed, 1), 0, CONFIG.steer.maxPredict);
+    return Steering.flee(a, tPos.add(tVel.mul(T)));
+  },
+  wander(a) {                                                        // project a circle ahead, jitter a point on it
+    const S = CONFIG.steer; a.wanderAngle = clamp(a.wanderAngle + rand(-1, 1) * S.wanderJitter, -1.6, 1.6);
+    const dir = a.vel.len() > 5 ? a.vel.norm() : Vec2.fromAngle(a.heading);
+    const target = a.pos.add(dir.mul(S.wanderDist)).add(Vec2.fromAngle(dir.angle() + a.wanderAngle, S.wanderRadius));
+    return Steering.seek(a, target);
+  },
+  /** Three feelers (whiskers). Each hit pushes along the wall normal, proportionally to how far the feeler penetrates. */
+  avoidObstacles(a, grid) {
+    const S = CONFIG.steer, sp = a.vel.len(), dir = sp > 5 ? a.vel.norm() : Vec2.fromAngle(a.heading);
+    const L = a.radius + S.feelerBase + sp * S.feelerSpeed;
+    const defs = [[0, L], [S.feelerAngle, L * S.feelerSide], [-S.feelerAngle, L * S.feelerSide]];
+    let f = new Vec2(), centerHit = null, leftT = 1, rightT = 1;
+    defs.forEach(([ang, len], i) => {
+      const d = dir.rot(ang), end = a.pos.add(d.mul(len)), h = grid.raycast(a.pos.x, a.pos.y, end.x, end.y);
+      if (i === 1) leftT = h.hit ? h.t : 1; if (i === 2) rightT = h.hit ? h.t : 1;
+      if (!h.hit) return;
+      if (i === 0) centerHit = h;
+      f = f.add(new Vec2(h.nx, h.ny).mul(((1 - h.t) * len * a.maxForce) / L));
+    });
+    if (centerHit && Math.abs(centerHit.nx * dir.x + centerHit.ny * dir.y) > 0.85) {      // head-on: also slide sideways
+      const side = leftT === rightT ? (a.id % 2 ? 1 : -1) : leftT > rightT ? 1 : -1;
+      f = f.add(dir.perp().mul(side * a.maxForce * 0.8));
+    }
+    return f.clamp(a.maxForce * 1.5);
+  },
+  /** Push away from close neighbours; heavier neighbours push harder (Brute shoves weaker units aside). */
+  separation(a, others) {
+    let f = new Vec2();
+    for (const o of others) {
+      if (o === a || o.flying !== a.flying) continue;
+      const R = a.radius + o.radius + CONFIG.steer.sepPadding, off = a.pos.sub(o.pos), d = off.len();
+      if (d >= R || d < 1e-3) continue;
+      f = f.add(off.mul(1 / d).mul(((R - d) / R) * a.maxForce * Math.min(3, o.mass / a.mass)));
+    }
+    return f.clamp(a.maxForce * 1.5);
+  },
+};
+
+/* =====================================================================
+ *  FSM — tiny finite-state machine used by every enemy
+ * ===================================================================== */
+class FSM {
+  constructor(owner) { this.owner = owner; this.states = {}; this.cur = null; this.name = ''; this.time = 0; }
+  add(name, def) { this.states[name] = def; return this; }
+  set(name, ...args) {
+    if (this.cur && this.cur.exit) this.cur.exit();
+    const prev = this.name; this.name = name; this.cur = this.states[name]; this.time = 0;
+    if (this.cur.enter) this.cur.enter(...args);
+    if (this.owner.onStateChange) this.owner.onStateChange(prev, name);
+  }
+  update(dt) { this.time += dt; if (this.cur && this.cur.update) this.cur.update(dt); }
+}
+
+/* =====================================================================
+ *  Blackboard — shared knowledge for coordination without planning
+ * ===================================================================== */
+class Blackboard {
+  constructor(game) { this.game = game; this.slots = new Map(); this.report = null; this.lastPing = null; }
+  reportSighting(pos) { this.report = { pos: pos.clone(), t: this.game.time }; }
+  freshReport(maxAge = 2.5) { return this.report && this.game.time - this.report.t < maxAge ? this.report : null; }
+  claimSlot(agent) {                              // assigned angle slots around the player → natural pincer
+    const used = new Set(this.slots.values()), free = CONFIG.ai.slots.filter((s) => !used.has(s));
+    const pick = free.length ? free[0] : CONFIG.ai.slots[randInt(0, CONFIG.ai.slots.length - 1)];
+    this.slots.set(agent.id, pick); return pick;
+  }
+  release(agent) { this.slots.delete(agent.id); }
+  ping(pos) { this.lastPing = { pos: pos.clone(), t: this.game.time }; }
+}
+
+/* =====================================================================
+ *  Agent — position/velocity body, steering blend, path following, stuck handling
+ *  Concepts: kinematic vs steering movement (toggle K), obstacle avoidance, separation, path following
+ * ===================================================================== */
+let NEXT_ID = 1;
+class Agent {
+  constructor(game, pos, cfg) {
+    this.game = game; this.id = NEXT_ID++; this.pos = pos.clone(); this.vel = new Vec2(); this.heading = rand(0, 2 * PI);
+    this.radius = cfg.radius; this.mass = cfg.mass; this.maxForce = cfg.force; this.maxSpeed = 60; this.flying = false;
+    this.path = []; this.pi = 0; this.route = null; this.regionRoute = null; this.pathGoal = null; this.pending = null; this.replanTimer = 0;
+    this.wanderAngle = 0; this.lookAt = null; this.predicted = null; this.wait = 0; this.stuck = 0; this.stuckCheck = { p: pos.clone(), t: 0 };
+    this.goal = new Vec2(); this.goalWeight = 1;
+    this.dbg = { seek: new Vec2(), avoid: new Vec2(), sep: new Vec2(), final: new Vec2() };
+    this.dead = false; this.visible = false;
+  }
+  // ---- path state helpers
+  setPath(pts) { this.path = pts; this.pi = 0; }
+  appendPath(pts) { for (const p of pts) this.path.push(p); }
+  clearPath() { this.path = []; this.pi = 0; this.route = null; this.regionRoute = null; this.pathGoal = null; this.game.paths.cancel(this); this.game.resv.releaseAgent(this.id); }
+  hasPath() { return this.pi < this.path.length; }
+  pathFinished() { return !this.pending && this.pi >= this.path.length && (!this.route || this.route.done); }
+  /** Replan policy (continuous-time idea): never every frame. Only when target moved > X tiles, route is invalid, or timer expired AND target moved a bit. */
+  pathTo(goal, priority = 2) {
+    const P = CONFIG.path, st = this.game.paths.stats, T = this.game.grid.tile;
+    this.replanTimer -= CONFIG.step;
+    if (this.pending) { if (this.pathGoal && goal.dist(this.pathGoal) > T) this.game.paths.request(this, goal, priority); return; }
+    const none = !this.pathGoal, moved = this.pathGoal ? goal.dist(this.pathGoal) : 0;
+    if (none || moved > P.targetMoveTiles * T) { if (!none) st.replansMoved++; this.game.paths.request(this, goal, priority); this.pathGoal = goal.clone(); return; }
+    if (this.replanTimer <= 0) {
+      this.replanTimer = rand(P.replanMin, P.replanMax);
+      if (moved > T * 0.6) { st.replansTimer++; this.game.paths.request(this, goal, priority); this.pathGoal = goal.clone(); return; }
+    }
+    if (this.hasPath() && this.pi < this.path.length && !this.flying && this.game.grid.raycast(this.pos.x, this.pos.y, this.path[this.pi].x, this.path[this.pi].y).hit) {
+      st.replansBlocked++; this.game.paths.request(this, goal, priority, 'repair');          // next waypoint blocked → local repair only
+    }
+  }
+  /** Path-following: seek the current waypoint, look-ahead skipping, arrive at the end. Also reservation waiting. */
+  followPath() {
+    const G = this.game.grid;
+    if (this.route && !this.route.done && !this.pending && this.path.length - this.pi <= 2) this.game.paths.request(this, this.pathGoal || this.pos, 0, 'refine');
+    while (this.pi < this.path.length - 1) {
+      const wp = this.path[this.pi], nx = this.path[this.pi + 1];
+      if (this.pos.dist(wp) < 16 || (this.pos.dist(nx) < 70 && G.clearLine(this.pos, nx, this.radius))) this.pi++; else break;
+    }
+    if (this.pi >= this.path.length) return this.stop();
+    const wp = this.path[this.pi], last = this.pi === this.path.length - 1 && (!this.route || this.route.done);
+    if (last && this.pos.dist(wp) < 10) { this.pi++; return this.stop(); }
+    // time-aware waiting: if the next choke tile is reserved by someone arriving now, hold position briefly
+    if (!this.flying && this.wait <= 0) {
+      const c = G.cellOf(wp);
+      if (G.choke[c] && this.pos.dist(wp) < 60) {
+        const h = this.game.resv.holder(c, this.game.time, this.id);
+        if (h && this.game.enemyById(h.id)) { const o = this.game.enemyById(h.id); if (o.pos.dist(wp) < this.pos.dist(wp)) { this.wait = rand(0.25, CONFIG.path.waitMax); this.game.resv.waits++; } }
+      }
+    }
+    if (this.wait > 0) { this.wait -= CONFIG.step; return this.stop(); }
+    return last ? Steering.arrive(this, wp, 60) : Steering.seek(this, wp);
+  }
+  stop() { return this.vel.mul(-1); }
+  /** Move toward a point: straight if body-clear, else via pathfinding. */
+  goTo(target, priority = 2, arriveSlow = 0) {
+    if (this.flying || this.game.grid.clearLine(this.pos, target, this.radius)) {
+      if (this.hasPath() || this.pathGoal) this.clearPath();
+      return arriveSlow ? Steering.arrive(this, target, arriveSlow) : Steering.seek(this, target);
+    }
+    this.pathTo(target, priority); return this.followPath();
+  }
+  // ---- per-tick motion: blend goal + avoidance + separation, integrate, collide
+  integrate(dt) {
+    const G = this.game.grid, S = CONFIG.steer, kin = this.game.kinematic;
+    const avoid = this.flying ? new Vec2() : Steering.avoidObstacles(this, G);
+    const sep = Steering.separation(this, this.game.enemies.filter((o) => o !== this && Math.abs(o.pos.x - this.pos.x) < 80 && Math.abs(o.pos.y - this.pos.y) < 80));
+    const goal = this.goal.mul(S.wGoal * this.goalWeight), avoidW = avoid.mul(S.wAvoid), sepW = sep.mul(S.wSep);
+    this.dbg.seek = this.goal.clone(); this.dbg.avoid = avoid; this.dbg.sep = sep;
+    const old = this.pos.clone();
+    if (kin) {                                                   // KINEMATIC: assign velocity directly, no inertia, snap turns
+      const desired = this.vel.add(goal).add(avoid.mul(S.kinematicAvoid)).add(sep.mul(S.kinematicAvoid));
+      this.vel = desired.clamp(this.maxSpeed); this.dbg.final = desired.sub(this.vel).add(this.vel);
+    } else {                                                     // STEERING: force → acceleration → velocity
+      const force = goal.add(avoidW).add(sepW).clamp(this.maxForce);
+      this.dbg.final = force; this.vel = this.vel.add(force.mul(dt));
+      const sp = this.vel.len(); if (sp > this.maxSpeed) this.vel = this.vel.mul(Math.max(this.maxSpeed / sp, 1 - 6 * dt));
+    }
+    this.pos = this.pos.add(this.vel.mul(dt));
+    if (this.flying) {
+      this.pos.x = clamp(this.pos.x, 20, G.w - 20); this.pos.y = clamp(this.pos.y, 20, G.h - 20);
+    } else if (G.resolveCircle(this.pos, this.radius)) {
+      const actual = this.pos.sub(old).mul(1 / dt); if (actual.len() < this.vel.len()) this.vel = actual;
+    }
+    // heading
+    const sp = this.vel.len(); let target = null;
+    if (this.lookAt) target = this.lookAt.sub(this.pos).angle(); else if (sp > S.faceSpeed) target = this.vel.angle();
+    if (target !== null) { const d = angleDiff(this.heading, target); this.heading += kin ? d : clamp(d, -S.turnRate * dt, S.turnRate * dt); }
+    this.stuckWatch(dt);
+  }
+  stuckWatch(dt) {
+    const sc = this.stuckCheck; sc.t += dt; if (sc.t < 0.5) return;
+    const moved = this.pos.dist(sc.p), wants = this.dbg.seek.len() > this.maxSpeed * 0.6 && this.wait <= 0;
+    this.stuck = wants && moved < 5 ? this.stuck + sc.t : 0;
+    if (this.stuck > 1.2) {                                      // unstick: replan and nudge sideways
+      this.stuck = 0; this.game.stats.unstuck++;
+      this.vel = this.vel.add(Vec2.fromAngle(rand(0, 2 * PI), 60));
+      if (this.pathGoal) this.game.paths.request(this, this.pathGoal, 0);
+    }
+    sc.p = this.pos.clone(); sc.t = 0;
+  }
+}
+
+/* =====================================================================
+ *  Hunters (Stalker / Flanker / Brute) — FSM + perception, built from SIMPLE parts
+ *  Concepts: decision making (FSM), weighted randomness, fair perception, Complexity Fallacy
+ * ===================================================================== */
+class Hunter extends Agent {
+  constructor(game, pos, kind) {
+    const cfg = CONFIG.enemies[kind]; super(game, pos, cfg);
+    this.kind = kind; this.cfg = cfg; this.diff = game.diff; this.maxSpeed = cfg.patrol;
+    this.alert = 0; this.reactLeft = -1; this.unseen = 9; this.seeing = false;
+    this.lastKnown = null; this.investigate = null; this.lostTime = 0;
+    this.patrolTarget = null; this.patrolWait = rand(0.2, 1.5); this.recent = [];
+    this.mode = 'attack'; this.modeTimer = 0; this.orbit = 1; this.aimErr = new Vec2(); this.aimTimer = 0;
+    this.searchCenter = null; this.searchTime = 0; this.searchDur = 4; this.searchTimer = 0; this.susArrive = 0;
+    this.hitCd = 0; this.markT = 0; this.slot = null; this.lastSeenT = -99;
+    this.fsm = new FSM(this); this.buildStates(); this.fsm.set('Patrol');
+  }
+  get mark() { const s = this.fsm.name; return s === 'Suspicious' ? '?' : (s === 'Chase' || s === 'Charge') ? '!' : ''; }
+  get speedMul() { return this.diff.speed; }
+  get hearMul() { return this.diff.hear; }
+  onStateChange(prev, now) {
+    const near = this.pos.dist(this.game.player.pos) < 600;
+    if (now === 'Suspicious' && prev !== 'Suspicious' && near) Sfx.suspicious();
+    if ((now === 'Chase' || now === 'Charge') && near) Sfx.alert();
+  }
+  // ---- perception: vision cone + LOS (no wall-hacks), reaction delay, gradual awareness
+  perceive(dt) {
+    const p = this.game.player, c = this.cfg, G = this.game.grid; let seeing = false;
+    const d = this.pos.dist(p.pos), chasing = this.fsm.name === 'Chase' || this.fsm.name === 'Charge', range = c.range * (chasing ? 1.25 : 1);
+    if (p.alive && d <= range) {
+      const inCone = Math.abs(angleDiff(this.heading, p.pos.sub(this.pos).angle())) <= deg(c.fov) / 2;
+      if ((inCone || d < c.sense) && G.los(this.pos, p.pos)) seeing = true;
+    }
+    this.seeing = seeing;
+    if (seeing) {
+      if (this.reactLeft < 0) this.reactLeft = rand(CONFIG.ai.reactMin, CONFIG.ai.reactMax) * this.diff.react;   // human-like delay
+      this.unseen = 0;
+      if (this.reactLeft > 0 && !chasing) this.reactLeft = Math.max(0, this.reactLeft - dt);
+      else {
+        this.alert = Math.min(1, this.alert + dt / (lerp(0.5, 1.2, d / range) * this.diff.react));
+        this.lastKnown = p.pos.clone(); this.game.board.reportSighting(p.pos);
+      }
+    } else { this.unseen += dt; this.alert = Math.max(0, this.alert - 0.3 * dt); if (this.unseen > 0.4) this.reactLeft = -1; }
+  }
+  /** Hearing: sound events arrive from Game.emitSound (distance already wall-adjusted). */
+  onNoise(pos, kind) {
+    const s = this.fsm.name;
+    if (s === 'Chase') { if (kind === 'sprint' && !this.seeing) { this.lastKnown = pos.add(new Vec2(rand(-30, 30), rand(-30, 30))); this.lostTime *= 0.5; } return; }
+    if (s === 'Charge' || s === 'Tired') return;
+    if (s === 'Suspicious' && kind !== 'decoy' && this.investigate && this.pos.dist(pos) > this.pos.dist(this.investigate)) return;
+    this.investigate = pos.clone(); this.alert = Math.max(this.alert, 0.45);
+    this.game.stats.noticed++;
+    if (s !== 'Suspicious') this.fsm.set('Suspicious');
+  }
+  onPing(pos) { if (this.fsm.name === 'Patrol' || this.fsm.name === 'Search') { this.investigate = pos.clone(); this.alert = Math.max(this.alert, 0.4); this.fsm.set('Suspicious'); } }
+  spotted() { this.fsm.set('Chase'); }
+  touch() {
+    const p = this.game.player;
+    if (p.alive && this.pos.dist(p.pos) < this.radius + p.radius + 3) p.hurt(this.pos, this.kind === 'brute' ? 1.6 : 1);
+  }
+  pickPatrol() {
+    const nodes = this.game.patrolNodes, here = this.pos;
+    const n = weightedPick(nodes, (c) => { const d = here.dist(c); return (d > 160 ? 1 : 0.15) * (this.recent.includes(c) ? 0.1 : 1) * (0.4 + Math.random()); });
+    this.recent.push(n); if (this.recent.length > 4) this.recent.shift(); return n;
+  }
+  rerollAim(dt) {
+    this.aimTimer -= dt; if (this.aimTimer > 0) return; this.aimTimer = 0.45;
+    const m = CONFIG.ai.aimNoise * clamp(this.pos.dist(this.game.player.pos) / this.cfg.range, 0.2, 1);
+    this.aimErr = new Vec2(rand(-m, m), rand(-m, m));
+  }
+  startSearch(center, dur) { this.fsm.set('Search', center, dur); }
+
+  buildStates() {
+    const self = this, c = this.cfg, D = () => this.diff;
+    this.fsm.add('Patrol', {
+      enter() { self.maxSpeed = c.patrol * self.speedMul; self.investigate = null; self.clearPath(); self.patrolTarget = null; self.patrolWait = rand(0.2, 1.2); },
+      update(dt) {
+        if (self.alert > CONFIG.ai.suspiciousThreshold) { self.investigate = self.lastKnown; return self.fsm.set('Suspicious'); }
+        if (self.patrolWait > 0) { self.patrolWait -= dt; self.goal = self.stop(); if (self.patrolWait <= 0) self.patrolTarget = self.pickPatrol(); return; }
+        self.goal = self.goTo(self.patrolTarget, 3, 70);
+        if (self.pos.dist(self.patrolTarget) < 34 || (self.pathFinished() && self.fsm.time > 1)) {
+          self.patrolWait = weightedPick([[rand(0.3, 0.8), 40], [rand(1, 2.5), 60]], (x) => x[1])[0]; self.clearPath();   // weighted pause length
+        }
+      },
+    });
+    this.fsm.add('Suspicious', {
+      enter() { self.maxSpeed = c.patrol * 1.5 * self.speedMul; self.susArrive = 0; self.clearPath(); if (!self.investigate) self.investigate = (self.lastKnown || self.pos).clone(); },
+      update(dt) {
+        if (self.alert >= 1) return self.spotted();
+        if (self.seeing && self.lastKnown) self.investigate = self.lastKnown.clone();
+        const d = self.pos.dist(self.investigate);
+        if (d > 36) { self.goal = self.goTo(self.investigate, 1); self.susArrive = 0; }
+        else { self.goal = self.stop(); self.susArrive += dt; self.lookAt = self.pos.add(Vec2.fromAngle(self.heading + Math.sin(self.fsm.time * 2.4) * 1.2, 40)); }
+        if (self.susArrive > 1.5 || self.fsm.time > 9) { const ctr = self.investigate; self.investigate = null; self.startSearch(ctr, CONFIG.ai.searchFromNoise); }
+      },
+    });
+    this.addChase();
+    this.fsm.add('Search', {
+      enter(center, dur) { self.maxSpeed = c.patrol * 1.3 * self.speedMul; self.searchCenter = (center || self.pos).clone(); self.searchTime = 0; self.searchDur = dur || 4; self.searchTimer = 0; self.clearPath(); },
+      update(dt) {
+        self.searchTime += dt;
+        if (self.alert > CONFIG.ai.suspiciousThreshold) { self.investigate = self.lastKnown; return self.fsm.set('Suspicious'); }
+        if (self.searchTime > self.searchDur) return self.fsm.set('Patrol');
+        self.searchTimer -= dt;
+        if (self.searchTimer <= 0) {                     // pick a random nearby point to check, then wander in between
+          self.searchTimer = rand(1.4, 2.4);
+          const a = rand(0, 2 * PI), r = rand(40, 150), pt = self.searchCenter.add(Vec2.fromAngle(a, r));
+          if (!self.game.grid.isWallAt(pt)) { self.pathGoal = null; self.searchPoint = pt; self.clearPath(); }
+        }
+        if (self.searchPoint && self.pos.dist(self.searchPoint) > 30) self.goal = self.goTo(self.searchPoint, 2);
+        else {
+          let g = Steering.wander(self, self.game.grid); const back = self.pos.dist(self.searchCenter);
+          if (back > 150) g = g.add(Steering.seek(self, self.searchCenter));
+          self.goal = g.mul(0.6);
+        }
+      },
+    });
+  }
+  /** Stalker chase: PURSUE while seen; A* path to the last known position when LOS is lost; weighted attack mix. */
+  addChase() {
+    const self = this, c = this.cfg;
+    this.fsm.add('Chase', {
+      enter() {
+        self.maxSpeed = c.chase * self.speedMul; self.lostTime = 0; self.alert = 1; self.reactLeft = 0; self.mode = 'attack'; self.modeTimer = 0; self.clearPath();
+        self.game.stats.spotted++; self.slot = self.wantsSlot ? self.game.board.claimSlot(self) : null;
+      },
+      exit() { self.game.board.release(self); self.slot = null; },
+      update(dt) {
+        const p = self.game.player;
+        if (self.seeing) self.lostTime = 0; else self.lostTime += dt;
+        const rep = self.game.board.freshReport(); if (!self.seeing && rep && (!self.lastKnown || rep.t > self.lastSeenT)) { self.lastKnown = rep.pos.clone(); }
+        if (self.seeing) self.lastSeenT = self.game.time;
+        if (self.lostTime > self.diff.lose * rand(0.9, 1.1) && self.lostTime > self.diff.lose * 0.9) return self.startSearch(self.lastKnown || self.pos, CONFIG.ai.searchFromChase);
+        if (!p.alive) return self.startSearch(self.pos, 3);
+        self.rerollAim(dt);
+        if (self.seeing) self.chaseSeen(dt, p); else self.chaseBlind(dt);
+        self.touchIfAttacking();
+      },
+    });
+  }
+  touchIfAttacking() { if (this.mode === 'attack') this.touch(); }
+  chaseSeen(dt, p) {
+    const c = this.cfg, d = this.pos.dist(p.pos);
+    this.modeTimer -= dt;
+    if (d < c.attackRange) {                                    // weighted randomness: attack 70 / reposition 20 / retreat 10
+      if (this.modeTimer <= 0) {
+        this.mode = weightedPick(CONFIG.ai.attackMix, (m) => m[1])[0]; this.orbit = Math.random() < 0.5 ? 1 : -1;
+        this.modeTimer = this.mode === 'retreat' ? rand(0.5, 0.9) : this.mode === 'reposition' ? rand(0.8, 1.4) : rand(0.9, 1.6);
+      }
+    } else if (this.mode !== 'attack' && this.modeTimer <= 0) this.mode = 'attack';
+    this.lookAt = p.pos;
+    if (this.mode === 'retreat') this.goal = Steering.flee(this, p.pos);
+    else if (this.mode === 'reposition') { const off = this.pos.sub(p.pos).norm().rot(this.orbit * 0.9).mul(c.attackRange * 1.2); this.goal = Steering.seek(this, p.pos.add(off)); }
+    else this.goal = this.attackSteer(p);
+    if (this.hasPath() && this.game.grid.clearLine(this.pos, p.pos, this.radius)) this.clearPath();
+  }
+  attackSteer(p) { return Steering.pursue(this, p.pos, p.vel, this.aimErr); }
+  chaseBlind(dt) {
+    const lk = this.lastKnown || this.pos;
+    this.goal = this.goTo(lk, 0, 50);
+    if (this.pos.dist(lk) < 32 && this.lostTime > 0.6) this.lostTime += dt * 3;   // reached last known spot, nothing there → give up sooner
+  }
+  update(dt) {
+    if (this.hitCd > 0) this.hitCd -= dt;
+    this.lookAt = null; this.goal = new Vec2(); this.predicted = null;
+    this.perceive(dt); this.fsm.update(dt); this.integrate(dt);
+  }
+}
+
+class Stalker extends Hunter { constructor(g, p) { super(g, p, 'stalker'); } }
+
+/** Flanker: same FSM; in Chase it aims for a point ahead/beside the player chosen from a blackboard slot. */
+class Flanker extends Hunter {
+  constructor(g, p) { super(g, p, 'flanker'); }
+  get wantsSlot() { return true; }
+  attackSteer(p) {
+    const d = this.pos.dist(p.pos);
+    if (d < CONFIG.ai.flankDist * 0.9) return Steering.pursue(this, p.pos, p.vel, this.aimErr);     // close in → final approach
+    const co = this.diff.coordination, sloppy = (this.id % 2 ? 1 : -1) * deg(rand(25, 55));
+    const slot = this.slot === null || this.slot === undefined ? 0 : deg(this.slot);
+    const ang = lerp(sloppy, slot, co);                                                                // better coordination with waves
+    const base = p.vel.len() > 30 ? p.vel.angle() : p.pos.sub(this.pos).angle() + PI;
+    let pt = p.pos.add(Vec2.fromAngle(base + ang, CONFIG.ai.flankDist));
+    if (this.game.grid.isWallAt(pt)) pt = p.pos.clone();
+    this.flankPoint = pt;
+    return this.goTo(pt, 0, 0);
+  }
+}
+
+/** Brute: Patrol → Suspicious → Charge (ARRIVE, committed) → Tired (pause) → Search. Pushes weaker units via mass-weighted separation. */
+class Brute extends Hunter {
+  constructor(g, p) { super(g, p, 'brute'); }
+  get mark() { const s = this.fsm.name; return s === 'Suspicious' ? '?' : s === 'Charge' ? '!' : ''; }
+  addChase() {
+    const self = this, c = this.cfg;
+    this.fsm.add('Charge', {
+      enter() {
+        self.maxSpeed = 0; self.windup = c.windup; self.charging = false; self.clearPath(); self.chargeT = 0; self.alert = 1; self.game.stats.spotted++;
+      },
+      update(dt) {
+        const p = self.game.player;
+        if (!self.charging) {                                       // wind-up telegraph: stands, faces player, picks a committed target
+          self.goal = self.stop(); self.lookAt = p.pos; self.windup -= dt;
+          if (self.windup <= 0) { self.charging = true; self.maxSpeed = c.charge * self.speedMul; self.chargeTarget = p.pos.add(new Vec2(rand(-24, 24), rand(-24, 24))).add(p.vel.mul(0.25)); }
+          return;
+        }
+        self.chargeT += dt;
+        self.goal = self.goTo(self.chargeTarget, 0, 130);           // ARRIVE: slows into the target instead of stopping dead
+        self.touch();
+        if (self.pos.dist(self.chargeTarget) < 34 || self.chargeT > c.chargeMax) self.fsm.set('Tired');
+      },
+    });
+    this.fsm.add('Tired', {
+      enter() { self.maxSpeed = 20; self.clearPath(); },
+      update() { self.goal = self.stop(); self.lookAt = null; if (self.fsm.time > c.tired) { if (self.seeing || self.alert > 0.5) self.fsm.set('Charge'); else self.startSearch(self.lastKnown || self.pos, CONFIG.ai.searchFromChase); } },
+    });
+  }
+  spotted() { this.fsm.set('Charge'); }
+}
+
+/* =====================================================================
+ *  Scout drone — flying, WANDER + EVADE, pings the blackboard (simple unit supporting the swarm)
+ * ===================================================================== */
+class Drone extends Agent {
+  constructor(game, pos) {
+    const cfg = CONFIG.enemies.drone; super(game, pos, cfg);
+    this.cfg = cfg; this.kind = 'drone'; this.flying = true; this.maxSpeed = cfg.wander * game.diff.speed;
+    this.pingCd = rand(1, 3); this.pingWind = 0; this.pingFx = 0; this.seesPlayer = false;
+    this.fsm = new FSM(this); const self = this;
+    this.fsm.add('Wander', {
+      enter() { self.maxSpeed = cfg.wander * game.diff.speed; },
+      update() {
+        let g = Steering.wander(self);
+        const G = game.grid, m = 90; if (self.pos.x < m || self.pos.y < m || self.pos.x > G.w - m || self.pos.y > G.h - m) g = g.add(Steering.seek(self, new Vec2(G.w / 2, G.h / 2)).mul(0.8));
+        self.goal = g;
+        const p = game.player, d = self.pos.dist(p.pos);
+        if (p.alive && d < cfg.evadeDist) return self.fsm.set('Evade');
+        if (p.alive && d < cfg.sight && self.pingCd <= 0) self.fsm.set('Ping');
+      },
+    });
+    this.fsm.add('Ping', {                                       // hover + beep (telegraphed), then broadcast
+      enter() { self.pingWind = cfg.pingWind; },
+      update(dt) {
+        const p = game.player; self.goal = self.stop(); self.pingWind -= dt;
+        if (self.pingWind <= 0) {
+          if (p.alive && self.pos.dist(p.pos) < cfg.sight * 1.1) game.dronePing(self, p.pos);
+          self.pingCd = cfg.pingCooldown; self.fsm.set('Wander');
+        }
+      },
+    });
+    this.fsm.add('Evade', {
+      enter() { self.maxSpeed = cfg.evade * game.diff.speed; },
+      update() {
+        const p = game.player, d = self.pos.dist(p.pos);
+        self.goal = Steering.evade(self, p.pos, p.vel);
+        const G = game.grid, m = 70; if (self.pos.x < m || self.pos.y < m || self.pos.x > G.w - m || self.pos.y > G.h - m) self.goal = self.goal.add(Steering.seek(self, new Vec2(G.w / 2, G.h / 2)));
+        if (d > cfg.calmDist || !p.alive) self.fsm.set('Wander');
+      },
+    });
+    this.fsm.set('Wander');
+  }
+  get mark() { return this.fsm.name === 'Ping' ? '!' : ''; }
+  update(dt) {
+    this.pingCd -= dt; if (this.pingFx > 0) this.pingFx -= dt;
+    this.lookAt = null; this.goal = new Vec2(); this.fsm.update(dt); this.integrate(dt);
+  }
+}
+
+/* =====================================================================
+ *  Player
+ * ===================================================================== */
+class Player {
+  constructor(pos) {
+    const c = CONFIG.player; this.pos = pos.clone(); this.vel = new Vec2(); this.radius = c.radius; this.hearts = c.hearts; this.stamina = c.stamina;
+    this.exhausted = false; this.regenWait = 0; this.invuln = 0; this.decoyCd = 0; this.stepT = 0; this.alive = true; this.sprinting = false; this.facing = 0; this.moving = false;
+  }
+  update(dt, input, game) {
+    const c = CONFIG.player; if (!this.alive) return;
+    const axis = input.axis(); this.moving = axis.len() > 0.1;
+    this.sprinting = input.sprinting() && this.moving && this.stamina > 0 && !this.exhausted;
+    const speed = this.sprinting ? c.sprint : c.walk, desired = axis.mul(speed);
+    this.vel = this.vel.add(desired.sub(this.vel).clamp(c.accel * dt));
+    if (!this.moving && this.vel.len() < 4) this.vel = new Vec2();
+    const old = this.pos.clone(); this.pos = this.pos.add(this.vel.mul(dt));
+    if (game.grid.resolveCircle(this.pos, this.radius)) this.vel = this.pos.sub(old).mul(1 / dt);
+    if (this.vel.len() > 10) this.facing = this.vel.angle();
+    if (this.sprinting) { this.stamina = Math.max(0, this.stamina - c.drain * dt); this.regenWait = c.regenDelay; if (this.stamina <= 0) this.exhausted = true; }
+    else { this.regenWait -= dt; if (this.regenWait <= 0) this.stamina = Math.min(c.stamina, this.stamina + c.regen * dt); }
+    if (this.exhausted && this.stamina >= c.recoverAt) this.exhausted = false;
+    if (this.invuln > 0) this.invuln -= dt; if (this.decoyCd > 0) this.decoyCd -= dt;
+    if (this.moving && this.vel.len() > 40) {                 // footsteps make noise: sprint is loud, walk is nearly silent
+      this.stepT -= dt;
+      if (this.stepT <= 0) { this.stepT = this.sprinting ? 0.28 : 0.42; Sfx.step(this.sprinting); game.emitSound(this.pos, this.sprinting ? c.sprintNoise : c.walkNoise, this.sprinting ? 'sprint' : 'walk'); }
+    }
+    if (input.consume('KeyE')) game.dropDecoy(this.pos.clone());
+    if (input.consumeClick() && game.mode === 'play') game.dropDecoy(game.mouseWorld());
+  }
+  hurt(from, mul = 1) {
+    if (this.invuln > 0 || !this.alive || window.HUNTED.god) return;
+    this.hearts--; this.invuln = CONFIG.player.invuln; Sfx.hit(); game.shake = 14;
+    this.vel = this.pos.sub(from).norm().mul(300 * mul);
+    if (this.hearts <= 0) { this.alive = false; game.gameOver(); }
+  }
+}
+
+/* =====================================================================
+ *  Spawner / waves
+ * ===================================================================== */
+const Spawner = {
+  spawnWave(game) {
+    const d = game.diff, list = [['stalker', d.stalkers], ['flanker', d.flankers], ['brute', d.brutes], ['drone', d.drones]];
+    for (const [kind, n] of list) for (let i = 0; i < n; i++) this.spawn(game, kind);
+  },
+  spawn(game, kind, minDist = 520) {
+    const spots = game.openCells; let pos = null;
+    for (let tries = 0; tries < 80 && !pos; tries++) {
+      const c = game.grid.center(spots[randInt(0, spots.length - 1)]);
+      if (c.dist(game.player.pos) < minDist - tries * 4) continue;
+      if (game.enemies.some((e) => e.pos.dist(c) < 60)) continue;
+      pos = c;
+    }
+    if (!pos) pos = game.grid.center(spots[randInt(0, spots.length - 1)]);
+    const e = kind === 'stalker' ? new Stalker(game, pos) : kind === 'flanker' ? new Flanker(game, pos) : kind === 'brute' ? new Brute(game, pos) : new Drone(game, pos);
+    game.enemies.push(e); return e;
+  },
+};
+
+/* =====================================================================
+ *  Game — owns world state, update order, objectives
+ * ===================================================================== */
+class Game {
+  constructor(canvas, input) {
+    this.canvas = canvas; this.input = input; this.mode = 'title'; this.kinematic = false; this.time = 0;
+    this.debug = { on: false, nodes: false, regions: false }; this.shake = 0;
+    this.cam = new Vec2(); this.stats = this.freshStats(); this.wave = 1; this.enemies = []; this.decoys = []; this.beacons = []; this.fx = [];
+    this.banner = null; this.score = 0; this.clearTimer = 0;
+    this.newWave(1); this.player.alive = true;
+  }
+  freshStats() { return { spotted: 0, noticed: 0, beacons: 0, waves: 0, time: 0, unstuck: 0 }; }
+  mouseWorld() { return new Vec2(this.input.mouse.x + this.cam.x, this.input.mouse.y + this.cam.y); }
+  enemyById(id) { return this.enemies.find((e) => e.id === id); }
+
+  startRun() { this.stats = this.freshStats(); this.score = 0; this.wave = 1; this.newWave(1); this.mode = 'play'; this.runTime = 0; Sfx.init(); }
+  newWave(w) {
+    this.wave = w; this.diff = CONFIG.wave(w);
+    const arena = buildArena(w); this.grid = arena.g; this.reach = arena.reach;
+    this.astar = new AStar(this.grid); this.astar.traceOn = this.debug.nodes; this.regions = new RegionGraph(this.grid, this.astar); this.resv = new ReservationTable();
+    this.paths = new PathService(this); this.board = new Blackboard(this);
+    this.player = new Player(arena.start); this.enemies = []; this.decoys = []; this.fx = []; this.collected = 0; this.extractOpen = false; this.waveTime = 0;
+    const open = []; for (let i = 0; i < this.grid.cols * this.grid.rows; i++) if (this.reach[i] && this.grid.isOpen(this.grid.cx(i), this.grid.cy(i))) open.push(i);
+    this.openCells = open;
+    // patrol nodes, beacons, extraction — all on reachable open tiles
+    this.patrolNodes = []; for (let i = 0; i < this.diff.patrolNodes; i++) this.patrolNodes.push(this.grid.center(open[randInt(0, open.length - 1)]));
+    this.beacons = []; const start = arena.start;
+    for (let n = 0, tries = 0; n < CONFIG.objective.beacons; tries++) {
+      const p = this.grid.center(open[randInt(0, open.length - 1)]), minD = Math.max(120, 420 - tries * 2);
+      if (p.dist(start) < Math.max(200, 520 - tries * 2) || this.beacons.some((b) => b.pos.dist(p) < minD)) continue;
+      this.beacons.push({ pos: p, got: false, t: rand(0, 6) }); n++;
+    }
+    let ex = null; for (let tries = 0; !ex; tries++) { const p = this.grid.center(open[randInt(0, open.length - 1)]); if (p.dist(start) > 800 - tries * 3 && !this.beacons.some((b) => b.pos.dist(p) < 100)) ex = p; }
+    this.extraction = ex;
+    Spawner.spawnWave(this);
+    this.cam = this.player.pos.sub(new Vec2(CONFIG.view.w / 2, CONFIG.view.h / 2));
+    this.banner = { text: `WAVE ${w} — find ${CONFIG.objective.beacons} relay beacons`, t: 3.5 };
+    window.dispatchEvent(new Event('hunted-newmap'));
+  }
+
+  // ---- sound events: hunters hear footsteps/decoys, wall-adjusted distance (sound is muffled by walls)
+  emitSound(pos, radius, kind) {
+    this.fx.push({ type: 'ring', pos: pos.clone(), r: 0, max: radius, t: 0, life: kind === 'decoy' ? 0.9 : 0.5, kind });
+    for (const e of this.enemies) {
+      if (!(e instanceof Hunter)) continue;
+      const d = e.pos.dist(pos) * (this.grid.los(e.pos, pos) ? 1 : 1.5);
+      if (d <= radius * e.hearMul) e.onNoise(pos, kind);
+    }
+  }
+  dropDecoy(target) {
+    const p = this.player, c = CONFIG.player; if (p.decoyCd > 0 || !p.alive) return;
+    const v = target.sub(p.pos), d = v.len();
+    let pos = d > c.decoyRange ? p.pos.add(v.norm().mul(c.decoyRange)) : target.clone();
+    const h = this.grid.raycast(p.pos.x, p.pos.y, pos.x, pos.y); if (h.hit) pos = new Vec2(h.x - h.nx * 0, h.y).sub(v.norm().mul(8));
+    if (this.grid.isWallAt(pos)) pos = p.pos.clone();
+    p.decoyCd = c.decoyCooldown; this.decoys.push({ pos, life: c.decoyLife, pulse: 0 }); Sfx.decoy();
+  }
+  dronePing(drone, pos) {
+    drone.pingFx = 1; this.board.ping(pos); Sfx.ping();
+    this.fx.push({ type: 'ring', pos: drone.pos.clone(), r: 0, max: CONFIG.enemies.drone.pingRadius, t: 0, life: 0.8, kind: 'ping' });
+    for (const e of this.enemies) if (e instanceof Hunter && e.pos.dist(drone.pos) < CONFIG.enemies.drone.pingRadius) e.onPing(pos);
+  }
+  addHunters(n) { for (let i = 0; i < n && this.enemies.length < CONFIG.maxEnemies; i++) Spawner.spawn(this, Math.random() < 0.5 ? 'stalker' : 'flanker', 360); }
+
+  gameOver() { this.mode = 'dead'; Sfx.lose(); this.stats.time = this.runTime; }
+  waveClear() {
+    this.mode = 'clear'; this.clearTimer = 3; this.stats.waves++; Sfx.win();
+    this.score += 1000 * this.wave + Math.max(0, Math.round(300 - this.waveTime)) * 2 + this.player.hearts * 100;
+  }
+
+  update(dt) {
+    if (this.mode !== 'play') {
+      if (this.mode === 'clear') { this.clearTimer -= dt; if (this.clearTimer <= 0) { this.newWave(this.wave + 1); this.mode = 'play'; } }
+      return;
+    }
+    this.time += dt; this.waveTime += dt; this.runTime = (this.runTime || 0) + dt;
+    this.player.update(dt, this.input, this);
+    for (const d of this.decoys) { d.life -= dt; d.pulse -= dt; if (d.pulse <= 0) { d.pulse = 0.8; this.emitSound(d.pos, CONFIG.player.decoyRadius, 'decoy'); } }
+    this.decoys = this.decoys.filter((d) => d.life > 0);
+    for (const e of this.enemies) {
+      e.update(dt);
+      e.visible = e.pos.dist(this.player.pos) < 520 && this.grid.los(e.pos, this.player.pos) || e.pos.dist(this.player.pos) < 110;
+    }
+    this.paths.processFrame();
+    if (Math.floor(this.time * 2) !== Math.floor((this.time - dt) * 2)) this.resv.cleanup(this.time);
+    // objectives
+    for (const b of this.beacons) if (!b.got && b.pos.dist(this.player.pos) < CONFIG.objective.pickup) {
+      b.got = true; this.collected++; this.stats.beacons++; this.score += 100; Sfx.beacon();
+      this.banner = { text: `Beacon ${this.collected}/${CONFIG.objective.beacons}`, t: 1.6 };
+      if (this.collected >= CONFIG.objective.beacons) { this.extractOpen = true; Sfx.open(); this.banner = { text: 'EXTRACTION OPEN — reach the green signal', t: 3.5 }; }
+    }
+    if (this.extractOpen && this.extraction.dist(this.player.pos) < CONFIG.objective.extract) this.waveClear();
+    // fx + camera
+    for (const f of this.fx) f.t += dt; this.fx = this.fx.filter((f) => f.t < f.life);
+    if (this.banner) { this.banner.t -= dt; if (this.banner.t <= 0) this.banner = null; }
+    const target = this.player.pos.add(this.player.vel.mul(0.18)).sub(new Vec2(CONFIG.view.w / 2, CONFIG.view.h / 2));
+    this.cam = this.cam.add(target.sub(this.cam).mul(1 - Math.pow(0.001, dt)));
+    this.cam.x = clamp(this.cam.x, 0, this.grid.w - CONFIG.view.w); this.cam.y = clamp(this.cam.y, 0, this.grid.h - CONFIG.view.h);
+    if (this.shake > 0) this.shake = Math.max(0, this.shake - 40 * dt);
+  }
+}
+
+/* =====================================================================
+ *  Renderer — canvas primitives only. Static map is pre-rendered; fog of war uses a
+ *  line-of-sight light polygon so walls genuinely hide enemies (fair stealth).
+ * ===================================================================== */
+class Renderer {
+  constructor(canvas) {
+    this.ctx = canvas.getContext('2d'); this.fog = document.createElement('canvas'); this.fog.width = CONFIG.view.w; this.fog.height = CONFIG.view.h; this.fctx = this.fog.getContext('2d');
+    this.map = document.createElement('canvas'); this.mini = document.createElement('canvas'); this.mini.width = 160; this.mini.height = 120;
+  }
+  prerender(game) {
+    const g = game.grid, T = g.tile; this.map.width = g.w; this.map.height = g.h; const c = this.map.getContext('2d');
+    c.fillStyle = '#10141c'; c.fillRect(0, 0, g.w, g.h);
+    for (let y = 0; y < g.rows; y++) for (let x = 0; x < g.cols; x++) {
+      if (g.walls[g.idx(x, y)]) continue;
+      const v = (Math.sin(x * 12.9898 + y * 78.233) * 43758.5453) % 1;
+      c.fillStyle = `rgba(${40 + (v < 0 ? -v : v) * 25 | 0},${50 + (v < 0 ? -v : v) * 25 | 0},${65 + (v < 0 ? -v : v) * 30 | 0},0.35)`; c.fillRect(x * T + 1, y * T + 1, T - 2, T - 2);
+    }
+    for (let y = 0; y < g.rows; y++) for (let x = 0; x < g.cols; x++) {
+      if (!g.walls[g.idx(x, y)]) continue;
+      c.fillStyle = '#2b3345'; c.fillRect(x * T, y * T, T, T);
+      c.fillStyle = '#394258'; c.fillRect(x * T, y * T, T, 5);
+      if (!g.isWall(x, y + 1)) { c.fillStyle = '#171c28'; c.fillRect(x * T, y * T + T - 7, T, 7); }
+      c.strokeStyle = '#1b2130'; c.strokeRect(x * T + 0.5, y * T + 0.5, T - 1, T - 1);
+    }
+    const m = this.mini.getContext('2d'); m.clearRect(0, 0, 160, 120); m.fillStyle = 'rgba(0,0,0,0.55)'; m.fillRect(0, 0, 160, 120);
+    m.fillStyle = '#5b6783'; for (let y = 0; y < g.rows; y++) for (let x = 0; x < g.cols; x++) if (g.walls[g.idx(x, y)]) m.fillRect(x * 4, y * 4, 4, 4);
+  }
+  render(game, debug) {
+    const ctx = this.ctx, V = CONFIG.view, cam = game.cam;
+    const sh = game.shake, ox = sh ? rand(-sh, sh) * 0.3 : 0, oy = sh ? rand(-sh, sh) * 0.3 : 0;
+    ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.fillStyle = '#000'; ctx.fillRect(0, 0, V.w, V.h);
+    ctx.save(); ctx.translate(-Math.round(cam.x) + ox, -Math.round(cam.y) + oy);
+    ctx.drawImage(this.map, 0, 0);
+    this.drawObjectives(ctx, game);
+    for (const d of game.decoys) { ctx.fillStyle = '#ffd36b'; ctx.beginPath(); ctx.arc(d.pos.x, d.pos.y, 6, 0, 7); ctx.fill(); }
+    const vis = game.debug.on;
+    for (const e of game.enemies) if (vis || e.visible || e.pos.dist(game.player.pos) < CONFIG.player.light + 20) this.drawEnemy(ctx, e);
+    this.drawPlayer(ctx, game.player);
+    ctx.restore();
+    // ---- fog of war
+    const f = this.fctx; f.globalCompositeOperation = 'source-over'; f.clearRect(0, 0, V.w, V.h);
+    f.fillStyle = `rgba(2,3,7,${game.debug.on ? 0.55 : 0.94})`; f.fillRect(0, 0, V.w, V.h);
+    f.globalCompositeOperation = 'destination-out';
+    const px = game.player.pos.x - cam.x + ox, py = game.player.pos.y - cam.y + oy, R = CONFIG.player.light;
+    f.save(); f.beginPath(); const N = 96;
+    for (let i = 0; i <= N; i++) {
+      const a = (i / N) * 2 * PI, ex = game.player.pos.x + Math.cos(a) * R, ey = game.player.pos.y + Math.sin(a) * R, h = game.grid.raycast(game.player.pos.x, game.player.pos.y, ex, ey);
+      const len = h.hit ? h.t * R + 30 : R, x = px + Math.cos(a) * len, y = py + Math.sin(a) * len;
+      if (i === 0) f.moveTo(x, y); else f.lineTo(x, y);
+    }
+    f.closePath(); f.clip();
+    const gr = f.createRadialGradient(px, py, 10, px, py, R); gr.addColorStop(0, 'rgba(0,0,0,1)'); gr.addColorStop(0.55, 'rgba(0,0,0,0.9)'); gr.addColorStop(1, 'rgba(0,0,0,0)');
+    f.fillStyle = gr; f.fillRect(px - R, py - R, 2 * R, 2 * R); f.restore();
+    for (const b of game.beacons) if (!b.got) this.punch(f, b.pos.x - cam.x + ox, b.pos.y - cam.y + oy, 70);
+    if (game.extractOpen) this.punch(f, game.extraction.x - cam.x + ox, game.extraction.y - cam.y + oy, 90);
+    for (const d of game.decoys) this.punch(f, d.pos.x - cam.x + ox, d.pos.y - cam.y + oy, 45);
+    ctx.drawImage(this.fog, 0, 0);
+    // ---- after fog: enemy flashlight cones/eyes, telegraphs, rings
+    ctx.save(); ctx.translate(-Math.round(cam.x) + ox, -Math.round(cam.y) + oy);
+    for (const e of game.enemies) if (e.visible) this.drawEnemyGlow(ctx, e);
+    for (const fx of game.fx) this.drawFx(ctx, fx);
+    ctx.restore();
+    this.drawEdgeArrows(ctx, game);
+    if (debug) debug.draw(ctx, game);
+  }
+  punch(f, x, y, r) { const g = f.createRadialGradient(x, y, 2, x, y, r); g.addColorStop(0, 'rgba(0,0,0,0.9)'); g.addColorStop(1, 'rgba(0,0,0,0)'); f.fillStyle = g; f.fillRect(x - r, y - r, 2 * r, 2 * r); }
+  drawObjectives(ctx, game) {
+    const t = performance.now() / 1000;
+    for (const b of game.beacons) if (!b.got) {
+      const pulse = 0.5 + 0.5 * Math.sin(t * 3 + b.t); ctx.save(); ctx.globalCompositeOperation = 'lighter';
+      const g = ctx.createRadialGradient(b.pos.x, b.pos.y, 2, b.pos.x, b.pos.y, 40 + pulse * 8); g.addColorStop(0, 'rgba(120,220,255,0.8)'); g.addColorStop(1, 'rgba(120,220,255,0)');
+      ctx.fillStyle = g; ctx.beginPath(); ctx.arc(b.pos.x, b.pos.y, 50, 0, 7); ctx.fill(); ctx.restore();
+      ctx.fillStyle = '#bff3ff'; ctx.beginPath(); ctx.moveTo(b.pos.x, b.pos.y - 9); ctx.lineTo(b.pos.x + 7, b.pos.y); ctx.lineTo(b.pos.x, b.pos.y + 9); ctx.lineTo(b.pos.x - 7, b.pos.y); ctx.fill();
+    }
+    if (game.extractOpen) {
+      const p = 0.5 + 0.5 * Math.sin(t * 4); ctx.save(); ctx.globalCompositeOperation = 'lighter';
+      ctx.strokeStyle = `rgba(90,255,150,${0.6 + 0.4 * p})`; ctx.lineWidth = 4; ctx.beginPath(); ctx.arc(game.extraction.x, game.extraction.y, CONFIG.objective.extract + p * 5, 0, 7); ctx.stroke();
+      ctx.fillStyle = 'rgba(90,255,150,0.2)'; ctx.fill(); ctx.restore();
+    }
+  }
+  drawPlayer(ctx, p) {
+    if (!p.alive) return; const blink = p.invuln > 0 && Math.floor(performance.now() / 80) % 2;
+    ctx.save(); ctx.translate(p.pos.x, p.pos.y); ctx.rotate(p.facing); ctx.globalAlpha = blink ? 0.35 : 1;
+    ctx.fillStyle = p.sprinting ? '#ffe8a8' : '#e8f1ff'; ctx.beginPath(); ctx.arc(0, 0, p.radius, 0, 7); ctx.fill();
+    ctx.fillStyle = '#3b6cff'; ctx.beginPath(); ctx.moveTo(p.radius + 4, 0); ctx.lineTo(2, -6); ctx.lineTo(2, 6); ctx.fill(); ctx.restore();
+  }
+  drawEnemy(ctx, e) {
+    const x = e.pos.x, y = e.pos.y; ctx.save(); ctx.translate(x, y);
+    if (e.kind === 'drone') {
+      ctx.fillStyle = 'rgba(0,0,0,0.35)'; ctx.beginPath(); ctx.ellipse(0, 14, 9, 4, 0, 0, 7); ctx.fill(); ctx.translate(0, -8);
+      ctx.fillStyle = '#3fd7ff'; ctx.beginPath(); ctx.arc(0, 0, 7, 0, 7); ctx.fill();
+      const a = performance.now() / 40; ctx.strokeStyle = 'rgba(190,240,255,0.8)'; ctx.lineWidth = 2;
+      for (let i = 0; i < 4; i++) { const ang = i * PI / 2 + PI / 4; ctx.beginPath(); ctx.arc(Math.cos(ang) * 11, Math.sin(ang) * 11, 4, a, a + 3.5); ctx.stroke(); }
+    } else {
+      ctx.rotate(e.heading); const r = e.radius;
+      const col = e.kind === 'stalker' ? '#e5484d' : e.kind === 'flanker' ? '#b86bff' : '#ff8a3d';
+      ctx.fillStyle = col; ctx.strokeStyle = '#0008'; ctx.lineWidth = 2;
+      ctx.beginPath();
+      if (e.kind === 'brute') { for (let i = 0; i < 6; i++) { const a = i * PI / 3; ctx.lineTo(Math.cos(a) * r * 1.05, Math.sin(a) * r * 1.05); } }
+      else if (e.kind === 'flanker') { ctx.moveTo(r * 1.3, 0); ctx.lineTo(0, r); ctx.lineTo(-r, 0); ctx.lineTo(0, -r); }
+      else { ctx.moveTo(r * 1.3, 0); ctx.lineTo(-r, r * 0.9); ctx.lineTo(-r * 0.5, 0); ctx.lineTo(-r, -r * 0.9); }
+      ctx.closePath(); ctx.fill(); ctx.stroke();
+      if (e.fsm.name === 'Tired') { ctx.fillStyle = '#fff6'; ctx.beginPath(); ctx.arc(0, 0, r * 0.5, 0, 7); ctx.fill(); }
+    }
+    ctx.restore();
+  }
+  drawEnemyGlow(ctx, e) {
+    if (e.kind === 'drone') {
+      if (e.fsm.name === 'Ping') { ctx.strokeStyle = 'rgba(100,230,255,0.9)'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(e.pos.x, e.pos.y - 8, 14 + (1 - e.pingWind / CONFIG.enemies.drone.pingWind) * 20, 0, 7); ctx.stroke(); }
+    } else {
+      const chasing = e.fsm.name === 'Chase' || e.fsm.name === 'Charge';
+      ctx.save(); ctx.globalCompositeOperation = 'lighter';
+      const fov = deg(e.cfg.fov), R = e.cfg.range * (chasing ? 1.25 : 1);
+      const g = ctx.createRadialGradient(e.pos.x, e.pos.y, 10, e.pos.x, e.pos.y, R); g.addColorStop(0, chasing ? 'rgba(255,60,60,0.22)' : 'rgba(255,190,90,0.14)'); g.addColorStop(1, 'rgba(255,150,60,0)');
+      ctx.fillStyle = g; ctx.beginPath(); ctx.moveTo(e.pos.x, e.pos.y); ctx.arc(e.pos.x, e.pos.y, R, e.heading - fov / 2, e.heading + fov / 2); ctx.closePath(); ctx.fill();
+      ctx.fillStyle = chasing ? '#ff4040' : '#ffb347';
+      for (const s of [-1, 1]) { const q = e.pos.add(Vec2.fromAngle(e.heading + s * 0.5, e.radius * 0.8)); ctx.beginPath(); ctx.arc(q.x, q.y, 2.2, 0, 7); ctx.fill(); }
+      ctx.restore();
+      if (e.fsm.name === 'Charge' && !e.charging) {                         // brute wind-up telegraph
+        ctx.strokeStyle = 'rgba(255,80,40,0.8)'; ctx.setLineDash([6, 6]); ctx.beginPath(); ctx.arc(e.pos.x, e.pos.y, e.radius + 6 + (e.windup * 10), 0, 7); ctx.stroke(); ctx.setLineDash([]);
+      }
+    }
+    const m = e.mark;
+    if (m) { ctx.font = 'bold 22px system-ui'; ctx.textAlign = 'center'; ctx.lineWidth = 4; ctx.strokeStyle = '#000'; ctx.fillStyle = m === '!' ? '#ff5050' : '#ffd24a'; const yy = e.pos.y - e.radius - 14 - (e.kind === 'drone' ? 8 : 0); ctx.strokeText(m, e.pos.x, yy); ctx.fillText(m, e.pos.x, yy); }
+  }
+  drawFx(ctx, f) {
+    const k = f.t / f.life, col = f.kind === 'decoy' ? '255,211,107' : f.kind === 'ping' ? '100,230,255' : f.kind === 'sprint' ? '255,120,120' : '200,200,200';
+    if (f.kind === 'walk') return;
+    ctx.strokeStyle = `rgba(${col},${0.5 * (1 - k)})`; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(f.pos.x, f.pos.y, f.max * Math.min(1, k * 1.3) * (f.kind === 'sprint' ? 0.5 : 1), 0, 7); ctx.stroke();
+  }
+  drawEdgeArrows(ctx, game) {
+    const V = CONFIG.view, c = new Vec2(V.w / 2, V.h / 2), targets = game.beacons.filter((b) => !b.got).map((b) => [b.pos, '120,220,255']);
+    if (game.extractOpen) targets.push([game.extraction, '90,255,150']);
+    for (const [wp, col] of targets) {
+      const s = wp.sub(game.cam); if (s.x > 20 && s.x < V.w - 20 && s.y > 20 && s.y < V.h - 20) continue;
+      const d = s.sub(c), k = Math.min((V.w / 2 - 28) / Math.abs(d.x || 1e-6), (V.h / 2 - 28) / Math.abs(d.y || 1e-6)), p = c.add(d.mul(k)), a = d.angle();
+      ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(a); ctx.fillStyle = `rgba(${col},0.85)`; ctx.beginPath(); ctx.moveTo(12, 0); ctx.lineTo(-8, -8); ctx.lineTo(-8, 8); ctx.fill(); ctx.restore();
+    }
+  }
+}
+
+/* =====================================================================
+ *  DebugOverlay — the "teaching view": every AI concept made visible (F1)
+ * ===================================================================== */
+class DebugOverlay {
+  constructor(game) { this.game = game; }
+  col(e, a = 1) { return `hsla(${(e.id * 47) % 360},85%,62%,${a})`; }
+  draw(ctx, game) {
+    if (!game.debug.on) return;
+    const cam = game.cam, T = game.grid.tile;
+    ctx.save(); ctx.translate(-Math.round(cam.x), -Math.round(cam.y));
+    // region grid + hierarchical route (H)
+    if (game.debug.regions) {
+      const R = game.regions; ctx.strokeStyle = 'rgba(120,200,255,0.55)'; ctx.lineWidth = 1; ctx.setLineDash([8, 6]);
+      for (let x = 0; x <= game.grid.cols; x += R.rs) { ctx.beginPath(); ctx.moveTo(x * T, 0); ctx.lineTo(x * T, game.grid.h); ctx.stroke(); }
+      for (let y = 0; y <= game.grid.rows; y += R.rs) { ctx.beginPath(); ctx.moveTo(0, y * T); ctx.lineTo(game.grid.w, y * T); ctx.stroke(); }
+      ctx.setLineDash([]); ctx.font = '12px monospace'; ctx.fillStyle = 'rgba(120,200,255,0.8)';
+      for (let r = 0; r < R.rc * R.rr; r++) { const b = R.bounds(r); ctx.fillText('R' + r, b.x0 * T + 6, b.y0 * T + 16); }
+      ctx.fillStyle = 'rgba(255,255,255,0.7)'; for (const n of R.nodes) { const p = game.grid.center(n.cell); ctx.fillRect(p.x - 2, p.y - 2, 4, 4); }
+      for (const e of game.enemies) if (e.regionRoute) {
+        ctx.fillStyle = this.col(e, 0.1); ctx.strokeStyle = this.col(e, 0.9); ctx.lineWidth = 3; ctx.beginPath();
+        e.regionRoute.forEach((r, i) => { const b = R.bounds(r); ctx.fillRect(b.x0 * T, b.y0 * T, (b.x1 - b.x0 + 1) * T, (b.y1 - b.y0 + 1) * T); const cx = (b.x0 + b.x1 + 1) * T / 2, cy = (b.y0 + b.y1 + 1) * T / 2; if (i) ctx.lineTo(cx, cy); else ctx.moveTo(cx, cy); });
+        ctx.stroke();
+      }
+    }
+    // open/closed nodes (N)
+    if (game.debug.nodes) {
+      const A = game.astar; ctx.fillStyle = 'rgba(255,210,60,0.22)'; for (const i of A.traceClosed) ctx.fillRect(game.grid.cx(i) * T + 2, game.grid.cy(i) * T + 2, T - 4, T - 4);
+      ctx.fillStyle = 'rgba(70,255,130,0.3)'; for (const i of A.traceOpen) ctx.fillRect(game.grid.cx(i) * T + 2, game.grid.cy(i) * T + 2, T - 4, T - 4);
+    }
+    for (const e of game.enemies) this.drawAgent(ctx, e, game);
+    // decoy radius
+    ctx.strokeStyle = 'rgba(255,211,107,0.4)'; for (const d of game.decoys) { ctx.beginPath(); ctx.arc(d.pos.x, d.pos.y, CONFIG.player.decoyRadius, 0, 7); ctx.stroke(); }
+    ctx.restore();
+    this.drawPanel(ctx, game);
+  }
+  drawAgent(ctx, e, game) {
+    const c = e.cfg;
+    if (e.path.length > e.pi) {                                       // A* path (per-enemy colour)
+      ctx.strokeStyle = this.col(e); ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(e.pos.x, e.pos.y);
+      for (let i = e.pi; i < e.path.length; i++) ctx.lineTo(e.path[i].x, e.path[i].y); ctx.stroke();
+      ctx.fillStyle = this.col(e); for (let i = e.pi; i < e.path.length; i++) ctx.fillRect(e.path[i].x - 2.5, e.path[i].y - 2.5, 5, 5);
+    }
+    if (e.kind !== 'drone') {                                         // vision cone + hearing radius
+      const R = c.range * ((e.fsm.name === 'Chase' || e.fsm.name === 'Charge') ? 1.25 : 1), fov = deg(c.fov);
+      ctx.fillStyle = e.seeing ? 'rgba(255,60,60,0.22)' : 'rgba(255,230,120,0.10)'; ctx.strokeStyle = 'rgba(255,230,120,0.5)'; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(e.pos.x, e.pos.y); ctx.arc(e.pos.x, e.pos.y, R, e.heading - fov / 2, e.heading + fov / 2); ctx.closePath(); ctx.fill(); ctx.stroke();
+      ctx.setLineDash([3, 5]); ctx.strokeStyle = 'rgba(150,200,255,0.35)'; ctx.beginPath(); ctx.arc(e.pos.x, e.pos.y, CONFIG.player.sprintNoise * e.hearMul, 0, 7); ctx.stroke(); ctx.setLineDash([]);
+      if (e.lastKnown && (e.fsm.name === 'Chase' || e.fsm.name === 'Search')) { ctx.strokeStyle = '#ff0'; ctx.beginPath(); ctx.arc(e.lastKnown.x, e.lastKnown.y, 8, 0, 7); ctx.moveTo(e.lastKnown.x - 12, e.lastKnown.y); ctx.lineTo(e.lastKnown.x + 12, e.lastKnown.y); ctx.moveTo(e.lastKnown.x, e.lastKnown.y - 12); ctx.lineTo(e.lastKnown.x, e.lastKnown.y + 12); ctx.stroke(); }
+    } else { ctx.strokeStyle = 'rgba(100,230,255,0.3)'; ctx.beginPath(); ctx.arc(e.pos.x, e.pos.y, c.sight, 0, 7); ctx.stroke(); ctx.strokeStyle = 'rgba(255,100,100,0.3)'; ctx.beginPath(); ctx.arc(e.pos.x, e.pos.y, c.evadeDist, 0, 7); ctx.stroke(); }
+    if (e.predicted) { ctx.strokeStyle = '#0ff'; ctx.beginPath(); ctx.arc(e.predicted.x, e.predicted.y, 5, 0, 7); ctx.moveTo(e.pos.x, e.pos.y); ctx.lineTo(e.predicted.x, e.predicted.y); ctx.stroke(); }
+    // steering vectors: seek/goal (green), avoid (red), separation (blue), final (white)
+    const vec = (v, col, k) => { if (v.len() < 2) return; ctx.strokeStyle = col; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(e.pos.x, e.pos.y); ctx.lineTo(e.pos.x + v.x * k, e.pos.y + v.y * k); ctx.stroke(); };
+    const k = 0.12; vec(e.dbg.seek, '#3cff6a', k); vec(e.dbg.avoid, '#ff3b3b', k); vec(e.dbg.sep, '#4aa3ff', k); vec(e.dbg.final, '#ffffff', k);
+    // state label
+    const label = e.fsm.name + (e.fsm.name === 'Chase' ? ` [${e.mode}${e.slot !== null && e.slot !== undefined ? ' slot ' + e.slot : ''}]` : '') + (e.alert !== undefined ? ` a=${e.alert.toFixed(2)}` : '');
+    ctx.font = '11px monospace'; ctx.textAlign = 'center'; ctx.lineWidth = 3; ctx.strokeStyle = '#000'; ctx.fillStyle = '#fff'; ctx.strokeText(label, e.pos.x, e.pos.y - e.radius - 30); ctx.fillText(label, e.pos.x, e.pos.y - e.radius - 30);
+  }
+  drawPanel(ctx, game) {
+    const p = game.paths, st = p.stats, ft = game.perf, route = st.lastRoute;
+    const chasing = game.enemies.filter((e) => e.fsm.name === 'Chase' || e.fsm.name === 'Charge').length;
+    const avgReq = p.hist.reduce((a, b) => a + b, 0) / 60;
+    const lines = [
+      ['DEBUG — Game AI view (F1)', '#ffb347'],
+      [`Movement mode : ${game.kinematic ? 'KINEMATIC (direct velocity)' : 'STEERING (forces)'}   [K]`, game.kinematic ? '#ff8080' : '#80ff9a'],
+      [`FPS ${ft.fps.toFixed(0)}  frame ${ft.frame.toFixed(2)}ms (update ${ft.update.toFixed(2)} / render ${ft.render.toFixed(2)})`, '#ddd'],
+      [`Enemies ${game.enemies.length}  (chasing ${chasing})`, '#ddd'],
+      [`Path requests/tick ${avgReq.toFixed(2)}  peak ${p.peak}  cap K=${CONFIG.path.maxPerFrame}  queue ${p.queue.length} (max ${st.queueMax})`, '#ddd'],
+      [`Planner ${st.ms.toFixed(3)}ms/tick   plans: flat ${st.flatPlans}  hier ${st.hierPlans}  local repairs ${st.repairs}`, '#ddd'],
+      [`Nodes expanded — flat A*: ${st.lastFlat || '-'}   hierarchical: ${route && !route.flat ? route.expanded : '-'}`, '#7fd1ff'],
+      [`  (hier = abstract graph + lazily refined segments so far; flat shown when debug on)`, '#789'],
+      [`Replans: timer ${st.replansTimer}  target-moved ${st.replansMoved}  blocked ${st.replansBlocked}`, '#ddd'],
+      [`Reservations active ${game.resv.size}   choke waits ${game.resv.waits}   unstuck ${game.stats.unstuck}`, '#ddd'],
+    ];
+    const x = CONFIG.view.w - 520, y = 8, h = lines.length * 15 + 10;
+    ctx.fillStyle = 'rgba(8,10,16,0.82)'; ctx.fillRect(x, y, 512, h); ctx.strokeStyle = '#2a3040'; ctx.strokeRect(x + 0.5, y + 0.5, 512, h);
+    ctx.font = '11px monospace'; ctx.textAlign = 'left'; lines.forEach(([t, c], i) => { ctx.fillStyle = c; ctx.fillText(t, x + 8, y + 17 + i * 15); });
+    // legend: What you see → Concept
+    const leg = [
+      ['Character moves/snaps', 'Kinematic movement (K)'], ['Smooth turns, accelerates', 'Steering behaviours'],
+      ['Green vector', 'Seek / pursue / arrive / wander'], ['Red vector', 'Obstacle avoidance (whiskers)'], ['Blue vector', 'Separation'], ['White vector', 'Blended + clamped force'],
+      ['Coloured polyline', 'A* path (smoothed)'], ['Dashed blue regions (H)', 'Hierarchical route'], ['"?"  "!"  labels', 'FSM decision making'],
+      ['Yellow/red cone', 'Vision (100° / 260px)'], ['Dashed circle', 'Hearing radius (sprint)'], ['Cyan circle + line', 'Pursue prediction'],
+    ];
+    const ly = CONFIG.view.h - leg.length * 14 - 24, lx = CONFIG.view.w - 392;
+    ctx.fillStyle = 'rgba(8,10,16,0.82)'; ctx.fillRect(lx, ly, 384, leg.length * 14 + 20);
+    ctx.fillStyle = '#ffb347'; ctx.fillText('WHAT YOU SEE  →  CONCEPT', lx + 8, ly + 13);
+    leg.forEach(([a, b], i) => { ctx.fillStyle = '#ddd'; ctx.fillText(a, lx + 8, ly + 28 + i * 14); ctx.fillStyle = '#9fb0d0'; ctx.fillText('→ ' + b, lx + 165, ly + 28 + i * 14); });
+  }
+}
+
+/* =====================================================================
+ *  HUD / screens
+ * ===================================================================== */
+class HUD {
+  text(ctx, s, x, y, size = 14, col = '#fff', align = 'left', bold = false) { ctx.font = `${bold ? 'bold ' : ''}${size}px system-ui,Segoe UI,sans-serif`; ctx.textAlign = align; ctx.fillStyle = col; ctx.fillText(s, x, y); }
+  panel(ctx, x, y, w, h) { ctx.fillStyle = 'rgba(6,8,14,0.72)'; ctx.fillRect(x, y, w, h); ctx.strokeStyle = '#2a3040'; ctx.strokeRect(x + 0.5, y + 0.5, w, h); }
+  draw(ctx, game) {
+    const V = CONFIG.view, p = game.player;
+    if (game.mode === 'title') return this.title(ctx, game);
+    this.panel(ctx, 8, 8, 250, 92);
+    for (let i = 0; i < CONFIG.player.hearts; i++) this.text(ctx, '♥', 18 + i * 26, 34, 24, i < p.hearts ? '#ff4a6a' : '#3a2a33');
+    ctx.fillStyle = '#222a3a'; ctx.fillRect(16, 44, 140, 9); ctx.fillStyle = p.exhausted ? '#c0503a' : '#ffd24a'; ctx.fillRect(16, 44, 140 * (p.stamina / CONFIG.player.stamina), 9);
+    this.text(ctx, 'STAMINA', 162, 52, 10, '#9aa6c0');
+    const cd = p.decoyCd > 0; ctx.fillStyle = '#222a3a'; ctx.fillRect(16, 58, 140, 7); ctx.fillStyle = cd ? '#6a5a30' : '#ffd36b'; ctx.fillRect(16, 58, 140 * (cd ? 1 - p.decoyCd / CONFIG.player.decoyCooldown : 1), 7);
+    this.text(ctx, cd ? 'DECOY…' : 'DECOY [E/click]', 162, 65, 10, cd ? '#9aa6c0' : '#ffd36b');
+    this.text(ctx, `Beacons ${game.collected}/${CONFIG.objective.beacons}`, 16, 86, 13, '#8fe3ff', 'left', true);
+    this.text(ctx, `Wave ${game.wave}`, 120, 86, 13, '#fff', 'left', true);
+    const t = Math.floor(game.waveTime); this.text(ctx, `${Math.floor(t / 60)}:${String(t % 60).padStart(2, '0')}`, 190, 86, 13, '#fff');
+    this.text(ctx, `Score ${game.score}`, 16 + 235, 25, 13, '#ffb347', 'right', true);
+    if (game.banner && game.mode === 'play') { ctx.globalAlpha = Math.min(1, game.banner.t); this.text(ctx, game.banner.text, V.w / 2, 70, 22, '#fff', 'center', true); ctx.globalAlpha = 1; }
+    // minimap
+    const mx = 8, my = V.h - 128; ctx.drawImage(game.renderer.mini, mx, my);
+    const m = ctx.fillStyle; for (const b of game.beacons) if (!b.got) { ctx.fillStyle = '#8fe3ff'; ctx.fillRect(mx + b.pos.x / 10 - 2, my + b.pos.y / 10 - 2, 4, 4); }
+    if (game.extractOpen) { ctx.fillStyle = '#5aff96'; ctx.fillRect(mx + game.extraction.x / 10 - 3, my + game.extraction.y / 10 - 3, 6, 6); }
+    ctx.fillStyle = '#fff'; ctx.fillRect(mx + p.pos.x / 10 - 2, my + p.pos.y / 10 - 2, 4, 4); ctx.fillStyle = m;
+    ctx.strokeStyle = '#ffffff55'; ctx.strokeRect(mx + game.cam.x / 10, my + game.cam.y / 10, V.w / 10, V.h / 10);
+    if (game.mode === 'paused') this.overlay(ctx, 'PAUSED', 'P to resume   ·   R restart   ·   F1 debug view');
+    if (game.mode === 'clear') this.overlay(ctx, `WAVE ${game.wave} CLEARED`, `Score ${game.score}  ·  next wave: more hunters, sharper senses…`);
+    if (game.mode === 'dead') this.gameOver(ctx, game);
+  }
+  overlay(ctx, big, small) { const V = CONFIG.view; ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.fillRect(0, 0, V.w, V.h); this.text(ctx, big, V.w / 2, V.h / 2 - 6, 44, '#fff', 'center', true); this.text(ctx, small, V.w / 2, V.h / 2 + 30, 16, '#9fb0d0', 'center'); }
+  gameOver(ctx, game) {
+    const V = CONFIG.view, s = game.stats; ctx.fillStyle = 'rgba(20,0,4,0.75)'; ctx.fillRect(0, 0, V.w, V.h);
+    this.text(ctx, 'CAUGHT', V.w / 2, 200, 56, '#ff4a6a', 'center', true);
+    const t = Math.floor(s.time); const rows = [`Waves cleared: ${s.waves}`, `Beacons collected: ${s.beacons}`, `Time survived: ${Math.floor(t / 60)}:${String(t % 60).padStart(2, '0')}`, `Times spotted: ${s.spotted}`, `Final score: ${game.score}`];
+    rows.forEach((r, i) => this.text(ctx, r, V.w / 2, 260 + i * 28, 20, '#e6ecff', 'center')); this.text(ctx, 'Press R or Enter to try again', V.w / 2, 440, 18, '#ffb347', 'center');
+  }
+  title(ctx, game) {
+    const V = CONFIG.view; const g = ctx.createLinearGradient(0, 0, 0, V.h); g.addColorStop(0, '#05060b'); g.addColorStop(1, '#141a2a'); ctx.fillStyle = g; ctx.fillRect(0, 0, V.w, V.h);
+    this.text(ctx, 'HUNTED', V.w / 2, 120, 76, '#ff4a4a', 'center', true);
+    this.text(ctx, 'A top-down stealth chase built to demonstrate Game AI', V.w / 2, 154, 16, '#9fb0d0', 'center');
+    const lines = ['WASD / Arrows — move        Shift — sprint (loud! limited stamina)', 'E or click — throw a decoy noise (6s cooldown): hunters investigate it', 'Collect 5 relay beacons, then reach the green extraction signal', 'Enemies see only inside their cone with line-of-sight, and hear sprinting.',
+      'F1 debug view · K kinematic/steering · N A* nodes · H regions · T stress test · M mute · P pause · R restart'];
+    lines.forEach((l, i) => this.text(ctx, l, V.w / 2, 230 + i * 28, 16, i === 4 ? '#ffb347' : '#e6ecff', 'center'));
+    this.text(ctx, '"?" = suspicious (it heard or glimpsed you)     "!" = chasing you', V.w / 2, 400, 16, '#ffd24a', 'center');
+    const k = 0.6 + 0.4 * Math.sin(performance.now() / 300); ctx.globalAlpha = k; this.text(ctx, 'Click or press Enter to start', V.w / 2, 500, 24, '#fff', 'center', true); ctx.globalAlpha = 1;
+  }
+}
+
+/* =====================================================================
+ *  Game loop — fixed 60 Hz timestep with accumulator, rendered every animation frame
+ * ===================================================================== */
+const canvas = document.getElementById('c'), input = new Input(canvas), game = new Game(canvas, input);
+game.renderer = new Renderer(canvas); game.hud = new HUD(); game.debugOverlay = new DebugOverlay(game);
+game.perf = { fps: 60, frame: 0, update: 0, render: 0 };
+window.HUNTED = { game, CONFIG, god: false, Sfx };
+window.game = game;                            // convenience for the headless tests
+window.addEventListener('hunted-newmap', () => game.renderer.prerender(game));
+game.renderer.prerender(game);
+
+const bar = document.getElementById('bar');
+const actions = {
+  debug() { game.debug.on = !game.debug.on; },
+  mode() { game.kinematic = !game.kinematic; },
+  nodes() { game.debug.nodes = !game.debug.nodes; game.astar.traceOn = game.debug.nodes; if (game.debug.nodes) game.debug.on = true; },
+  regions() { game.debug.regions = !game.debug.regions; if (game.debug.regions) game.debug.on = true; },
+  stress() { game.addHunters(10); },
+  mute() { Sfx.setMuted(!Sfx.muted); },
+  pause() { if (game.mode === 'play') game.mode = 'paused'; else if (game.mode === 'paused') game.mode = 'play'; },
+  restart() { game.startRun(); },
+};
+bar.addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) { Sfx.init(); actions[b.dataset.act](); canvas.focus(); } });
+function syncButtons() {
+  for (const b of bar.children) {
+    const a = b.dataset.act; const on = (a === 'debug' && game.debug.on) || (a === 'nodes' && game.debug.nodes) || (a === 'regions' && game.debug.regions) || (a === 'mute' && Sfx.muted) || (a === 'pause' && game.mode === 'paused');
+    b.classList.toggle('on', !!on);
+    if (a === 'mode') b.textContent = 'Mode: ' + (game.kinematic ? 'Kinematic' : 'Steering') + ' (K)';
+    if (a === 'mute') b.textContent = Sfx.muted ? 'Sound: OFF (M)' : 'Sound: on (M)';
+  }
+}
+function handleKeys() {
+  const k = (c) => input.consume(c);
+  if (input.anyInput) { Sfx.init(); }
+  if (k('F1')) actions.debug(); if (k('KeyK')) actions.mode(); if (k('KeyN')) actions.nodes(); if (k('KeyH')) actions.regions();
+  if (k('KeyT')) actions.stress(); if (k('KeyM')) actions.mute(); if (k('KeyP')) actions.pause(); if (k('KeyR')) actions.restart();
+  if (k('Enter') || k('Space')) { if (game.mode === 'title' || game.mode === 'dead') game.startRun(); }
+  if (game.mode === 'title' && input.consumeClick()) game.startRun();
+  if (game.mode === 'dead' && input.consumeClick()) game.startRun();
+}
+document.addEventListener('visibilitychange', () => { if (document.hidden && game.mode === 'play') game.mode = 'paused'; });
+
+let last = performance.now(), acc = 0;
+function frame(now) {
+  const t0 = performance.now(), dt = Math.min(0.1, (now - last) / 1000); last = now; acc += dt;
+  handleKeys();
+  let steps = 0; const u0 = performance.now();
+  while (acc >= CONFIG.step && steps < 5) { game.update(CONFIG.step); acc -= CONFIG.step; steps++; }
+  if (steps === 5) acc = 0;
+  const u1 = performance.now();
+  if (game.mode === 'title') { game.hud.draw(game.renderer.ctx, game); }
+  else { game.renderer.render(game, game.debugOverlay); game.hud.draw(game.renderer.ctx, game); }
+  const t1 = performance.now(), P = game.perf, a = 0.05;
+  P.update = lerp(P.update, u1 - u0, a); P.render = lerp(P.render, t1 - u1, a); P.frame = lerp(P.frame, t1 - t0, a); P.fps = lerp(P.fps, 1 / Math.max(dt, 0.001), 0.05);
+  syncButtons(); input.endFrame();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+})();
+</script>
+</body>
+</html>
